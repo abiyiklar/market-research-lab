@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-research-lab"
+version = "0.1.0"
+description = "Python starter collector for BIST market research data."
+requires-python = ">=3.11"
+dependencies = [
+    "pandas>=2.2",
+    "yfinance>=0.2.54",
+    "pyarrow>=17.0",
+]
+
+[project.scripts]
+bist-collector = "bist_research.collector:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
