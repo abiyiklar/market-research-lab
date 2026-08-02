@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 bist-collector = "bist_research.collector:main"
+bist-features = "bist_research.features:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
