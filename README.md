@@ -10,6 +10,7 @@ File or Folder | Purpose
 `tests/` | pytest coverage for the collector
 `data/raw/` | yfinance raw downloads, ignored by git
 `data/processed/` | cleaned datasets and reports, ignored by git
+`data/features/` | generated analysis datasets and quality summaries, ignored by git
 `logs/` | collector logs, ignored by git
 
 ## Setup
@@ -52,6 +53,24 @@ python -m bist_research --start-date 2020-01-01 --symbols TUPRS.IS XU100.IS
 ```
 
 The collector removes rows with missing `Close` values. Zero-volume records are reported separately only for equity symbols.
+
+## Build TUPRS Features
+
+Build the analysis dataset from the cleaned Parquet files in `data/processed`:
+
+```powershell
+python -m bist_research.features
+```
+
+The pipeline uses TUPRS trading dates as its calendar, left joins the other markets, and only forward-fills external values. All returns and indicators use current and historical observations only. The first 200 TUPRS rows are marked with `is_indicator_warmup`.
+
+Outputs:
+
+- `data/features/tuprs_features.csv`
+- `data/features/tuprs_features.parquet`
+- `data/features/tuprs_feature_summary.csv`
+
+Relative momentum is calculated from the TUPRS/XU100 relative-strength ratio. Rolling volatility is annualized using 252 trading days.
 
 ## Tests
 
