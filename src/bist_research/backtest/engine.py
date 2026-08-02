@@ -14,6 +14,7 @@ from .models import (
     BacktestConfig,
     BacktestResult,
     PendingEntry,
+    PendingExit,
     Position,
     Trade,
 )
@@ -21,6 +22,7 @@ from .strategy import baseline_entry_signal, close_exit_reason, prepare_strategy
 
 
 EntrySignal = Callable[[pd.Series, BacktestConfig], bool]
+ExitSignal = Callable[[pd.Series, int, BacktestConfig], str | None]
 
 REQUIRED_COLUMNS = (
     "date",
@@ -88,10 +90,12 @@ class BacktestEngine:
         self,
         config: BacktestConfig | None = None,
         entry_signal: EntrySignal = baseline_entry_signal,
+        exit_signal: ExitSignal = close_exit_reason,
         logger: logging.Logger | None = None,
     ) -> None:
         self.config = config or BacktestConfig()
         self.entry_signal = entry_signal
+        self.exit_signal = exit_signal
         self.logger = logger or logging.getLogger("bist_research.backtest")
 
     def run(self, feature_data: pd.DataFrame) -> BacktestResult:
@@ -102,6 +106,7 @@ class BacktestEngine:
         cash = self.config.initial_capital
         position: Position | None = None
         pending_entry: PendingEntry | None = None
+        pending_exit: PendingExit | None = None
         trades: list[Trade] = []
         equity_rows: list[dict[str, object]] = []
 
@@ -110,57 +115,94 @@ class BacktestEngine:
             is_last_row = row_number == len(rows) - 1
 
             if position is None and pending_entry is not None:
-                position, cash = self._open_position(row, pending_entry, len(trades) + 1, cash)
-                pending_entry = None
+                if pending_entry.sessions_until_entry <= 1:
+                    position, cash = self._open_position(
+                        row, pending_entry, len(trades) + 1, cash
+                    )
+                    pending_entry = None
+                else:
+                    pending_entry = PendingEntry(
+                        signal_date=pending_entry.signal_date,
+                        atr_at_signal=pending_entry.atr_at_signal,
+                        sessions_until_entry=pending_entry.sessions_until_entry - 1,
+                    )
 
             if position is not None:
                 position.holding_days += 1
                 stop_price = position.current_stop
-                if float(row["tuprs_low"]) <= stop_price:
-                    raw_exit = min(float(row["tuprs_open"]), stop_price)
-                    stop_reason = (
-                        "trailing_stop"
-                        if stop_price > position.initial_stop + 1e-12
-                        else "atr_stop"
+                stop_reason = self._stop_reason(position)
+
+                # A gap through the known stop happens before a pending open exit.
+                if float(row["tuprs_open"]) <= stop_price:
+                    self._update_exit_excursions(position, float(row["tuprs_open"]))
+                    trade, cash = self._close_position(
+                        position,
+                        date,
+                        float(row["tuprs_open"]),
+                        stop_reason,
+                        cash,
                     )
-                    competing_reason = close_exit_reason(row, position.holding_days, self.config)
-                    if competing_reason is None and is_last_row:
-                        competing_reason = "end_of_period"
-                    if competing_reason is not None and float(row["tuprs_close"]) < raw_exit:
-                        raw_exit = float(row["tuprs_close"])
-                        reason = f"{stop_reason}+{competing_reason}"
-                    else:
-                        reason = stop_reason
-                    position.maximum_price = max(position.maximum_price, raw_exit)
-                    position.minimum_price = min(position.minimum_price, raw_exit)
-                    trade, cash = self._close_position(position, date, raw_exit, reason, cash)
+                    trades.append(trade)
+                    position = None
+                    pending_exit = None
+                elif pending_exit is not None:
+                    self._update_exit_excursions(position, float(row["tuprs_open"]))
+                    trade, cash = self._close_position(
+                        position,
+                        date,
+                        float(row["tuprs_open"]),
+                        pending_exit.reason,
+                        cash,
+                    )
+                    trades.append(trade)
+                    position = None
+                    pending_exit = None
+                elif float(row["tuprs_low"]) <= stop_price:
+                    self._update_exit_excursions(position, stop_price)
+                    trade, cash = self._close_position(
+                        position,
+                        date,
+                        stop_price,
+                        stop_reason,
+                        cash,
+                    )
                     trades.append(trade)
                     position = None
                 else:
                     self._update_excursions(position, row)
                     position.highest_close = max(position.highest_close, float(row["tuprs_close"]))
-                    reason = close_exit_reason(row, position.holding_days, self.config)
-                    if reason is None and is_last_row:
-                        reason = "end_of_period"
-                    if reason is not None:
+                    if is_last_row:
                         trade, cash = self._close_position(
                             position,
                             date,
                             float(row["tuprs_close"]),
-                            reason,
+                            "end_of_period",
                             cash,
                         )
                         trades.append(trade)
                         position = None
                     else:
+                        reason = self.exit_signal(row, position.holding_days, self.config)
+                        if reason is not None:
+                            pending_exit = PendingExit(signal_date=date, reason=reason)
                         trailing_stop = (
                             position.highest_close
                             - self.config.atr_trailing_multiplier * float(row["atr_14"])
                         )
                         position.current_stop = max(position.initial_stop, trailing_stop)
 
-            if position is None and not is_last_row and self._can_schedule_entry(row):
-                pending_entry = PendingEntry(date, float(row["atr_14"]))
+            if (
+                position is None
+                and pending_entry is None
+                and pending_exit is None
+                and not is_last_row
+                and self._can_schedule_entry(row)
+            ):
+                pending_entry = PendingEntry(
+                    date,
+                    float(row["atr_14"]),
+                    self.config.entry_delay_days,
+                )
 
             equity_rows.append(self._equity_row(row, cash, position))
 
@@ -287,6 +329,19 @@ class BacktestEngine:
     def _update_excursions(position: Position, row: pd.Series) -> None:
         position.maximum_price = max(position.maximum_price, float(row["tuprs_high"]))
         position.minimum_price = min(position.minimum_price, float(row["tuprs_low"]))
+
+    @staticmethod
+    def _update_exit_excursions(position: Position, exit_price: float) -> None:
+        position.maximum_price = max(position.maximum_price, exit_price)
+        position.minimum_price = min(position.minimum_price, exit_price)
+
+    @staticmethod
+    def _stop_reason(position: Position) -> str:
+        return (
+            "trailing_stop"
+            if position.current_stop > position.initial_stop + 1e-12
+            else "atr_stop"
+        )
 
     @staticmethod
     def _equity_row(

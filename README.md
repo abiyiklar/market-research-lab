@@ -12,6 +12,7 @@ File or Folder | Purpose
 `data/processed/` | cleaned datasets and reports, ignored by git
 `data/features/` | generated analysis datasets and quality summaries, ignored by git
 `data/backtest/` | generated backtest tables, ignored by git
+`data/research/` | generated experiment, walk-forward, stress, and ablation tables, ignored by git
 `reports/` | generated backtest reports and charts, ignored by git
 `logs/` | collector logs, ignored by git
 
@@ -84,7 +85,7 @@ python -m bist_research.backtest.cli
 
 The engine calculates signals from daily closes and executes entries at the next eligible open. It excludes indicator warm-up rows, blocks new entries on zero-volume days, uses whole shares without leverage, and applies configurable commission and slippage costs.
 
-Baseline V1 keeps its parameters fixed: the XU100 daily-return floor is `-3%`, the entry RSI range is `50-72`, the minimum volume ratio is `1.10`, the initial ATR stop is `2.5x`, the trailing ATR stop is `3.0x`, and the maximum holding period is 60 trading days. Close-based exits are evaluated at the close; intraday stops use levels known before that day's low is tested.
+Baseline V1 keeps its parameters fixed: the XU100 daily-return floor is `-3%`, the entry RSI range is `50-72`, the minimum volume ratio is `1.10`, the initial ATR stop is `2.5x`, the trailing ATR stop is `3.0x`, and the maximum holding period is 60 trading days. Close-based exits are signaled at the close and filled at the next trading day's open. Intraday stops use levels known before that day's low is tested; gap stops fill at the open and normal stops fill at the stop level.
 
 Results are reported independently for train (`2013-2019`), validation (`2020-2022`), and test (`2023-latest`) periods, plus the full history. No parameter optimization or machine learning is performed.
 
@@ -99,7 +100,34 @@ python -m bist_research.backtest.cli `
   --slippage-rate 0.0005
 ```
 
-The command writes trade, daily-equity, metric, period, benchmark, and drawdown tables to `data/backtest/`. The Markdown report and equity, drawdown, annual-return, trade-return, and benchmark charts are written to `reports/`.
+The command writes trade, daily-equity, metric, period, benchmark, drawdown, and corporate-action data-quality tables to `data/backtest/`. The Markdown report and equity, drawdown, annual-return, trade-return, and benchmark charts are written to `reports/`.
+
+The strategy uses raw TUPRS OHLC for signals and execution. The benchmark table reports `tuprs_raw_buy_hold` separately from `tuprs_adjusted_total_return`. The adjusted benchmark uses Yahoo Adjusted Close as a return index, which reflects dividend and split adjustments; adjusted OHLC is not used to run the strategy.
+
+## Run Controlled Strategy Research
+
+Run the deterministic research engine with its default cap of 150 experiments:
+
+```powershell
+python -m bist_research.research.cli
+```
+
+The engine evaluates `baseline_v1_fixed`, `trend_following`, `breakout`, `pullback_in_uptrend`, and `relative_strength` families. It uses rolling 4-year train, 1-year validation, and 1-year out-of-sample windows. Candidate ranking combines OOS CAGR, profit factor, Sharpe ratio, drawdown, result dispersion, benchmark excess, and trade adequacy. OOS results are never used to generate or retune parameters.
+
+Bounded example:
+
+```powershell
+python -m bist_research.research.cli `
+  --max-experiments 30 `
+  --random-seed 20240801 `
+  --strategy trend_following breakout `
+  --output-dir data/research `
+  --report-dir reports
+```
+
+The best 10 experiments receive doubled-cost, parameter perturbation, start-offset, best-trade-removal, delayed-entry, and deterministic signal-skip stress tests. The same candidates receive one-filter-at-a-time ablation for market regime, volume, RSI, relative strength, trend, oil, and USDTRY filters.
+
+Research CSV files are appended by deterministic experiment keys so prior experiment rows are retained. Reports include the leaderboard, top-candidate summary, robustness heatmap, walk-forward returns, family comparison, and parameter-stability chart. No machine learning or open-ended "search until good" loop is used.
 
 ## Tests
 

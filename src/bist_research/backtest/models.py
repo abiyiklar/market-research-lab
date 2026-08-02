@@ -59,6 +59,7 @@ class BacktestConfig:
     minimum_market_return: float = -0.03
     risk_free_rate: float = 0.0
     trading_days_per_year: int = 252
+    entry_delay_days: int = 1
 
     def __post_init__(self) -> None:
         if self.initial_capital <= 0:
@@ -77,12 +78,21 @@ class BacktestConfig:
             raise ValueError("minimum_rsi cannot exceed maximum_entry_rsi")
         if self.trading_days_per_year <= 0:
             raise ValueError("trading_days_per_year must be positive")
+        if self.entry_delay_days <= 0:
+            raise ValueError("entry_delay_days must be positive")
 
 
 @dataclass(frozen=True)
 class PendingEntry:
     signal_date: pd.Timestamp
     atr_at_signal: float
+    sessions_until_entry: int = 1
+
+
+@dataclass(frozen=True)
+class PendingExit:
+    signal_date: pd.Timestamp
+    reason: str
 
 
 @dataclass

@@ -202,11 +202,33 @@ def calculate_tuprs_buy_hold(
     slippage = quantity * (effective_entry - raw_entry) + quantity * (raw_exit - effective_exit)
     equity = _benchmark_equity_curve(eligible["date"], values, config.initial_capital)
     return BenchmarkResult(
-        name="tuprs_buy_hold",
+        name="tuprs_raw_buy_hold",
         daily_equity=equity,
         total_commission=entry_commission + exit_commission,
         total_slippage=slippage,
     )
+
+
+def calculate_tuprs_adjusted_total_return(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+) -> BenchmarkResult:
+    if "tuprs_adj_close" not in frame:
+        raise ValueError("Adjusted TUPRS benchmark requires tuprs_adj_close")
+    eligible = frame.loc[
+        (~frame["is_indicator_warmup"].astype(bool))
+        & frame["tuprs_adj_close"].notna()
+        & (frame["tuprs_adj_close"] > 0)
+    ].reset_index(drop=True)
+    if eligible.empty:
+        raise ValueError("No eligible rows for the adjusted TUPRS benchmark")
+
+    starting_price = float(eligible["tuprs_adj_close"].iloc[0])
+    values = (
+        config.initial_capital * eligible["tuprs_adj_close"] / starting_price
+    ).astype(float).tolist()
+    equity = _benchmark_equity_curve(eligible["date"], values, config.initial_capital)
+    return BenchmarkResult(name="tuprs_adjusted_total_return", daily_equity=equity)
 
 
 def calculate_xu100_buy_hold(
