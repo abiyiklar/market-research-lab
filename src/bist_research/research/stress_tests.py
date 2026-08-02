@@ -13,6 +13,26 @@ from .strategies import ResearchStrategy, build_strategy, deterministic_signal_f
 from .walk_forward import _slice, run_strategy_period
 
 
+STRESS_COLUMNS = (
+    "experiment_id",
+    "strategy_name",
+    "parameters",
+    "scenario",
+    "data_scope",
+    "methodology_version",
+    "selected_window_count",
+    "total_return",
+    "maximum_drawdown",
+    "profit_factor",
+    "total_trades",
+    "sharpe_ratio",
+    "calmar_ratio",
+    "annual_volatility",
+    "stress_test_result",
+    "stability_class",
+)
+
+
 def _metric_row(
     experiment: Experiment,
     scenario: str,
@@ -216,7 +236,7 @@ def run_stress_tests(
 
     results = pd.DataFrame(rows)
     if results.empty:
-        return results
+        return pd.DataFrame(columns=STRESS_COLUMNS)
     classifications = {
         experiment_id: _classify_stability(group)
         for experiment_id, group in results.groupby("experiment_id")

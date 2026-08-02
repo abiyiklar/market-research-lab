@@ -9,6 +9,45 @@ MINIMUM_POSITIVE_WINDOW_RATIO = 0.60
 MINIMUM_MEDIAN_PROFIT_FACTOR = 1.10
 MINIMUM_WORST_DRAWDOWN = -0.35
 
+LEADERBOARD_COLUMNS = (
+    "experiment_id",
+    "methodology_version",
+    "strategy_name",
+    "parameters",
+    "random_seed",
+    "git_commit",
+    "total_oos_trades",
+    "oos_window_count",
+    "oos_run_count",
+    "positive_window_ratio",
+    "median_oos_cagr",
+    "median_profit_factor",
+    "median_sharpe",
+    "worst_drawdown",
+    "oos_return_std",
+    "median_benchmark_excess_return",
+    "median_volatility_matched_excess_return",
+    "median_sharpe_difference",
+    "median_calmar_difference",
+    "median_maximum_drawdown_difference",
+    "median_exposure_adjusted_return",
+    "median_exposure_matched_benchmark_return",
+    "data_quality_pass",
+    "lookahead_pass",
+    "hard_gate_pass",
+    "stress_stability_pass",
+    "statistically_robust",
+    "economically_competitive",
+    "economic_absolute_value_pass",
+    "economic_risk_adjusted_value_pass",
+    "deployment_ready",
+    "failed_gates",
+    "composite_score",
+    "stress_test_result",
+    "stability_class",
+    "decision",
+)
+
 
 def _finite_group(group: pd.DataFrame) -> bool:
     columns = (
@@ -160,7 +199,10 @@ def score_experiments(walk_forward_results: pd.DataFrame) -> pd.DataFrame:
                 "decision": "preliminary_research_candidate" if hard_gate_pass else "rejected",
             }
         )
-    return pd.DataFrame(rows).sort_values(
+    leaderboard = pd.DataFrame(rows, columns=LEADERBOARD_COLUMNS)
+    if leaderboard.empty:
+        return leaderboard
+    return leaderboard.sort_values(
         ["hard_gate_pass", "composite_score"], ascending=[False, False]
     ).reset_index(drop=True)
 

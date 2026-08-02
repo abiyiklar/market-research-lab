@@ -57,6 +57,15 @@ def _forced_signal(row: pd.Series, config: BacktestConfig) -> bool:
     return bool(row["force_signal"])
 
 
+def _never_exit(
+    row: pd.Series,
+    holding_days: int,
+    config: BacktestConfig,
+) -> None:
+    del row, holding_days, config
+    return None
+
+
 def _zero_cost_config(**overrides: object) -> BacktestConfig:
     values: dict[str, object] = {"commission_rate": 0.0, "slippage_rate": 0.0}
     values.update(overrides)
@@ -123,7 +132,7 @@ def test_no_dividend_is_credited_while_flat() -> None:
 def test_ex_dividend_cash_preserves_portfolio_equity() -> None:
     frame = _action_frame()
     frame.loc[0, "force_signal"] = True
-    frame.loc[2, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
+    frame.loc[2:, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
         90.0,
         92.0,
         88.0,
@@ -138,6 +147,67 @@ def test_ex_dividend_cash_preserves_portfolio_equity() -> None:
         equity.loc[frame.loc[1, "date"], "total_equity"]
     )
     assert equity.loc[frame.loc[2, "date"], "daily_return"] == pytest.approx(0.0)
+    trade = result.trades.iloc[0]
+    assert trade["entry_price_raw"] == 100.0
+    assert trade["exit_price_raw"] == 90.0
+    assert trade["dividend_cash"] == pytest.approx(trade["quantity"] * 10.0)
+    assert result.daily_equity["dividend_cash"].sum() == pytest.approx(
+        trade["dividend_cash"]
+    )
+    assert trade["net_pnl"] == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(
+    ("config_overrides", "expected_stop_before_dividend"),
+    [
+        ({"atr_stop_multiplier": 5.0, "atr_trailing_multiplier": 100.0}, 90.0),
+        ({"atr_stop_multiplier": 20.0, "atr_trailing_multiplier": 2.0}, 96.0),
+    ],
+    ids=["atr-stop", "trailing-stop"],
+)
+def test_pure_dividend_drop_does_not_trigger_raw_basis_stops(
+    config_overrides: dict[str, float],
+    expected_stop_before_dividend: float,
+) -> None:
+    frame = _action_frame()
+    frame["atr_14"] = 2.0
+    frame.loc[0, "force_signal"] = True
+    frame.loc[2:, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
+        90.0,
+        92.0,
+        88.0,
+        90.0,
+    ]
+    frame.loc[2, ["dividend_per_share", "corporate_action_flag"]] = [10.0, True]
+    config = _zero_cost_config(**config_overrides)
+
+    result = BacktestEngine(config, _forced_signal, _never_exit).run(frame)
+
+    assert result.daily_equity.loc[1, "current_stop"] == pytest.approx(
+        expected_stop_before_dividend
+    )
+    assert result.trades["exit_reason"].tolist() == ["end_of_period"]
+    assert result.trades.loc[0, "dividend_cash"] == pytest.approx(
+        result.trades.loc[0, "quantity"] * 10.0
+    )
+
+
+def test_pure_dividend_drop_does_not_trigger_false_trend_exit() -> None:
+    frame = _action_frame()
+    frame["ema_50"] = 95.0
+    frame.loc[0, "force_signal"] = True
+    frame.loc[2:, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
+        90.0,
+        92.0,
+        88.0,
+        90.0,
+    ]
+    frame.loc[2, ["dividend_per_share", "corporate_action_flag"]] = [10.0, True]
+
+    result = BacktestEngine(_zero_cost_config(), _forced_signal).run(frame)
+
+    assert result.trades["exit_reason"].tolist() == ["end_of_period"]
+    assert result.trades.loc[0, "exit_price_raw"] == 90.0
 
 
 def test_split_adjusted_prices_do_not_double_quantity() -> None:

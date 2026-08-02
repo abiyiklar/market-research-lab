@@ -35,7 +35,7 @@ def baseline_entry_signal(row: pd.Series, config: BacktestConfig) -> bool:
         "xu100_close",
         "xu100_ema_200",
         "xu100_return_1d",
-        "tuprs_close",
+        "tuprs_signal_close",
         "ema_20",
         "ema_50",
         "ema_100",
@@ -57,7 +57,7 @@ def baseline_entry_signal(row: pd.Series, config: BacktestConfig) -> bool:
         and row["xu100_return_1d"] >= config.minimum_market_return
     )
     tuprs_trend = (
-        row["tuprs_close"] > row["ema_200"]
+        row["tuprs_signal_close"] > row["ema_200"]
         and row["ema_20"] > row["ema_50"] > row["ema_100"]
     )
     relative_strength = (
@@ -75,7 +75,10 @@ def close_exit_reason(
     holding_days: int,
     config: BacktestConfig,
 ) -> str | None:
-    if math.isfinite(float(row["ema_50"])) and row["tuprs_close"] < row["ema_50"]:
+    if (
+        math.isfinite(float(row["ema_50"]))
+        and row["tuprs_signal_close"] < row["ema_50"]
+    ):
         return "trend_exit"
     if math.isfinite(float(row["relative_momentum_20d"])) and row["relative_momentum_20d"] < 0:
         return "relative_strength_exit"

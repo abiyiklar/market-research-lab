@@ -15,6 +15,7 @@ def _strategy_frame(row_count: int = 220) -> pd.DataFrame:
             "xu100_close": 1_000.0 + index,
             "xu100_return_1d": 0.001,
             "tuprs_close": close,
+            "tuprs_signal_close": close,
             "tuprs_volume": 1_000.0,
             "ema_20": close - 1,
             "ema_50": close - 2,

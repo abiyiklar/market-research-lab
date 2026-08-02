@@ -73,7 +73,7 @@ Build the analysis dataset from the cleaned Parquet files in `data/processed`:
 python -m bist_research.features
 ```
 
-The pipeline uses only tradable TUPRS sessions: positive volume, finite positive OHLC, and internally valid high/low bounds. It left joins the other markets and only forward-fills external values from prior observations. TUPRS prices are never forward-filled. All returns and indicators use current and historical observations only. The first 200 tradable TUPRS sessions are marked with `is_indicator_warmup`.
+The pipeline uses only tradable TUPRS sessions: positive volume, finite positive OHLC, and internally valid high/low bounds. It left joins the other markets and only forward-fills external values from prior observations. TUPRS prices are never forward-filled. TUPRS returns and indicators use a causal total-return-continuous signal OHLC built from raw prices and the dividend reported on that date; raw OHLC remains unchanged. The first 200 tradable TUPRS sessions are marked with `is_indicator_warmup`.
 
 Outputs:
 
@@ -91,7 +91,7 @@ Run the long-only daily reference strategy from the generated TUPRS feature data
 python -m bist_research.backtest.cli
 ```
 
-The engine calculates signals from daily closes and executes entries at the next eligible tradable open. Pending entries and exits carry across non-tradable rows; holding days, stops, and period liquidation use the same tradable-session calendar. It uses whole shares without leverage and applies configurable commission and slippage costs.
+The engine calculates signals from total-return-continuous daily signal closes and executes entries at the next eligible raw tradable open. Pending entries and exits carry across non-tradable rows; holding days, stops, and period liquidation use the same tradable-session calendar. It uses whole shares without leverage and applies configurable commission and slippage costs.
 
 Baseline V1 keeps its parameters fixed: the XU100 daily-return floor is `-3%`, the entry RSI range is `50-72`, the minimum volume ratio is `1.10`, the initial ATR stop is `2.5x`, the trailing ATR stop is `3.0x`, and the maximum holding period is 60 trading days. Close-based exits are signaled at the close and filled at the next trading day's open. Intraday stops use levels known before that day's low is tested; gap stops fill at the open and normal stops fill at the stop level.
 
@@ -110,7 +110,7 @@ python -m bist_research.backtest.cli `
 
 The command writes trade, daily-equity, metric, period, benchmark, drawdown, and corporate-action data-quality tables to `data/backtest/`. The Markdown report and equity, drawdown, annual-return, trade-return, and benchmark charts are written to `reports/`.
 
-The strategy uses raw TUPRS OHLC for signals, stops, and execution. Reported cash dividends are credited while long, net of the configurable `--dividend-withholding-rate` (default `0`). Yahoo TUPRS raw OHLC is audited around reported splits before any quantity treatment; split-adjusted prices are not adjusted a second time. The benchmark table reports raw buy-and-hold, explicit-dividend total return, and Yahoo Adjusted Close total return separately.
+The strategy uses `tuprs_signal_open/high/low/close` for indicators and signals while retaining raw TUPRS OHLC for fills. Reported cash dividends are credited once while long, net of the configurable `--dividend-withholding-rate` (default `0`); raw-basis stop and trailing references are reduced by the gross dividend before ex-date stop comparisons. Yahoo TUPRS raw OHLC is audited around reported splits before any quantity treatment, and split-adjusted prices are not adjusted a second time. The benchmark table reports raw buy-and-hold, explicit-dividend total return, and Yahoo Adjusted Close total return separately.
 
 ## Run Controlled Strategy Research
 

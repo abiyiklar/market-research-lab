@@ -9,6 +9,11 @@ import numpy as np
 import pandas as pd
 
 from bist_research.trading_calendar import only_tradable_tuprs_sessions
+from bist_research.features import (
+    SIGNAL_PRICE_COLUMNS,
+    add_features,
+    add_tuprs_signal_prices,
+)
 
 from .corporate_actions import PRICE_BASIS_UNADJUSTED
 from .models import (
@@ -33,6 +38,7 @@ REQUIRED_COLUMNS = (
     "tuprs_high",
     "tuprs_low",
     "tuprs_close",
+    *SIGNAL_PRICE_COLUMNS,
     "tuprs_volume",
     "xu100_close",
     "xu100_return_1d",
@@ -59,14 +65,13 @@ def load_feature_data(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Backtest input file not found: {path}")
     if path.suffix.lower() != ".parquet":
         raise ValueError("Backtest input must be a Parquet file")
-    return validate_feature_data(pd.read_parquet(path))
+    frame = pd.read_parquet(path)
+    if not set(SIGNAL_PRICE_COLUMNS).issubset(frame.columns):
+        frame = add_features(frame)
+    return validate_feature_data(frame)
 
 
 def validate_feature_data(frame: pd.DataFrame) -> pd.DataFrame:
-    missing = sorted(set(REQUIRED_COLUMNS).difference(frame.columns))
-    if missing:
-        raise ValueError(f"Feature dataset is missing required columns: {', '.join(missing)}")
-
     validated = frame.copy()
     optional_defaults: dict[str, object] = {
         "dividend_per_share": 0.0,
@@ -78,10 +83,15 @@ def validate_feature_data(frame: pd.DataFrame) -> pd.DataFrame:
     for column, default in optional_defaults.items():
         if column not in validated:
             validated[column] = default
+    source_required = set(REQUIRED_COLUMNS).difference(SIGNAL_PRICE_COLUMNS)
+    missing = sorted(source_required.difference(validated.columns))
+    if missing:
+        raise ValueError(f"Feature dataset is missing required columns: {', '.join(missing)}")
     validated["date"] = pd.to_datetime(validated["date"], errors="raise").dt.normalize()
     validated = validated.sort_values("date").reset_index(drop=True)
     if validated["date"].duplicated().any():
         raise ValueError("Feature dataset contains duplicate dates")
+    validated = add_tuprs_signal_prices(validated)
     if validated["is_indicator_warmup"].isna().any():
         raise ValueError("is_indicator_warmup contains missing values")
 
@@ -97,6 +107,10 @@ def validate_feature_data(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("TUPRS price columns must be positive outside warm-up rows")
     if (active["tuprs_high"] < active["tuprs_low"]).any():
         raise ValueError("TUPRS high price cannot be below low price")
+    if (active[list(SIGNAL_PRICE_COLUMNS)] <= 0).any().any():
+        raise ValueError("TUPRS signal-price columns must be positive outside warm-up rows")
+    if (active["tuprs_signal_high"] < active["tuprs_signal_low"]).any():
+        raise ValueError("TUPRS signal high price cannot be below signal low price")
     return validated
 
 
@@ -133,6 +147,7 @@ class BacktestEngine:
 
             if position is not None:
                 self._apply_stock_split(position, row)
+                self._apply_dividend_reference_adjustment(position, row)
                 dividend_cash = self._credit_dividend(position, row)
                 cash += dividend_cash
                 cumulative_dividend_cash += dividend_cash
@@ -210,7 +225,8 @@ class BacktestEngine:
                             pending_exit = PendingExit(signal_date=date, reason=reason)
                         trailing_stop = (
                             position.highest_close
-                            - self.config.atr_trailing_multiplier * float(row["atr_14"])
+                            - self.config.atr_trailing_multiplier
+                            * self._raw_basis_atr(row, float(row["atr_14"]), "close")
                         )
                         position.current_stop = max(position.initial_stop, trailing_stop)
 
@@ -271,7 +287,11 @@ class BacktestEngine:
 
         entry_commission = quantity * effective_price * self.config.commission_rate
         cash_after_entry = cash - quantity * effective_price - entry_commission
-        initial_stop = effective_price - self.config.atr_stop_multiplier * pending.atr_at_signal
+        initial_stop = (
+            effective_price
+            - self.config.atr_stop_multiplier
+            * self._raw_basis_atr(row, pending.atr_at_signal, "open")
+        )
         position = Position(
             trade_id=trade_id,
             signal_date=pending.signal_date,
@@ -396,6 +416,24 @@ class BacktestEngine:
         position.cumulative_dividend_cash += cash
         position.corporate_action_flag = True
         return cash
+
+    @staticmethod
+    def _apply_dividend_reference_adjustment(position: Position, row: pd.Series) -> None:
+        per_share = float(row.get("dividend_per_share", 0.0) or 0.0)
+        if not math.isfinite(per_share) or per_share <= 0:
+            return
+        position.initial_stop = max(0.0, position.initial_stop - per_share)
+        position.current_stop = max(0.0, position.current_stop - per_share)
+        position.highest_close = max(0.0, position.highest_close - per_share)
+        position.corporate_action_flag = True
+
+    @staticmethod
+    def _raw_basis_atr(row: pd.Series, signal_atr: float, price_point: str) -> float:
+        raw_price = float(row[f"tuprs_{price_point}"])
+        signal_price = float(row[f"tuprs_signal_{price_point}"])
+        if not math.isfinite(signal_price) or signal_price <= 0:
+            raise ValueError("TUPRS signal price must be positive for ATR conversion")
+        return signal_atr * raw_price / signal_price
 
     @staticmethod
     def _apply_stock_split(position: Position, row: pd.Series) -> None:

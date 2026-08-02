@@ -52,17 +52,17 @@ class ResearchStrategy:
         long = int(self.parameters.get("ema_long", 200))
         breakout_window = int(self.parameters.get("breakout_window", 20))
         prepared = prepared.copy()
-        prepared["research_ema_fast"] = prepared["tuprs_close"].ewm(
+        prepared["research_ema_fast"] = prepared["tuprs_signal_close"].ewm(
             span=fast, adjust=False, min_periods=fast
         ).mean()
-        prepared["research_ema_medium"] = prepared["tuprs_close"].ewm(
+        prepared["research_ema_medium"] = prepared["tuprs_signal_close"].ewm(
             span=medium, adjust=False, min_periods=medium
         ).mean()
-        prepared["research_ema_long"] = prepared["tuprs_close"].ewm(
+        prepared["research_ema_long"] = prepared["tuprs_signal_close"].ewm(
             span=long, adjust=False, min_periods=long
         ).mean()
         prepared["research_breakout_high"] = (
-            prepared["tuprs_close"]
+            prepared["tuprs_signal_close"]
             .rolling(breakout_window, min_periods=breakout_window)
             .max()
             .shift(1)
@@ -120,12 +120,12 @@ class ResearchStrategy:
         return (not self._enabled("trend")) or bool(
             _finite(
                 row,
-                "tuprs_close",
+                "tuprs_signal_close",
                 "research_ema_fast",
                 "research_ema_medium",
                 "research_ema_long",
             )
-            and row["tuprs_close"] > row["research_ema_long"]
+            and row["tuprs_signal_close"] > row["research_ema_long"]
             and row["research_ema_fast"] > row["research_ema_medium"]
             and row["research_ema_medium"] >= row["research_ema_long"]
         )
@@ -182,8 +182,15 @@ class BaselineV1FixedStrategy(ResearchStrategy):
             and row["xu100_return_1d"] >= config.minimum_market_return
         )
         trend = (not self._enabled("trend")) or bool(
-            _finite(row, "tuprs_close", "ema_20", "ema_50", "ema_100", "ema_200")
-            and row["tuprs_close"] > row["ema_200"]
+            _finite(
+                row,
+                "tuprs_signal_close",
+                "ema_20",
+                "ema_50",
+                "ema_100",
+                "ema_200",
+            )
+            and row["tuprs_signal_close"] > row["ema_200"]
             and row["ema_20"] > row["ema_50"] > row["ema_100"]
         )
         relative_strength = (not self._enabled("relative_strength")) or bool(
@@ -238,8 +245,8 @@ class TrendFollowingStrategy(ResearchStrategy):
     def exit_signal(
         self, row: pd.Series, holding_days: int, config: BacktestConfig
     ) -> str | None:
-        if _finite(row, "tuprs_close", "research_ema_medium") and row[
-            "tuprs_close"
+        if _finite(row, "tuprs_signal_close", "research_ema_medium") and row[
+            "tuprs_signal_close"
         ] < row["research_ema_medium"]:
             return "trend_exit"
         return self._maximum_holding_exit(holding_days, config)
@@ -250,8 +257,8 @@ class BreakoutStrategy(ResearchStrategy):
     def entry_signal(self, row: pd.Series, config: BacktestConfig) -> bool:
         del config
         breakout = bool(
-            _finite(row, "tuprs_close", "research_breakout_high")
-            and row["tuprs_close"] > row["research_breakout_high"]
+            _finite(row, "tuprs_signal_close", "research_breakout_high")
+            and row["tuprs_signal_close"] > row["research_breakout_high"]
         )
         return bool(
             breakout
@@ -264,8 +271,8 @@ class BreakoutStrategy(ResearchStrategy):
     def exit_signal(
         self, row: pd.Series, holding_days: int, config: BacktestConfig
     ) -> str | None:
-        if _finite(row, "tuprs_close", "research_ema_fast") and row[
-            "tuprs_close"
+        if _finite(row, "tuprs_signal_close", "research_ema_fast") and row[
+            "tuprs_signal_close"
         ] < row["research_ema_fast"]:
             return "breakout_failure_exit"
         return self._maximum_holding_exit(holding_days, config)
@@ -276,8 +283,8 @@ class PullbackInUptrendStrategy(ResearchStrategy):
     def entry_signal(self, row: pd.Series, config: BacktestConfig) -> bool:
         del config
         pullback = bool(
-            _finite(row, "tuprs_close", "research_ema_fast", "rsi_14")
-            and row["tuprs_close"] <= row["research_ema_fast"] * 1.015
+            _finite(row, "tuprs_signal_close", "research_ema_fast", "rsi_14")
+            and row["tuprs_signal_close"] <= row["research_ema_fast"] * 1.015
             and row["rsi_14"] <= float(self.parameters.get("rsi_upper", 70))
         )
         return bool(
@@ -292,8 +299,8 @@ class PullbackInUptrendStrategy(ResearchStrategy):
     def exit_signal(
         self, row: pd.Series, holding_days: int, config: BacktestConfig
     ) -> str | None:
-        if _finite(row, "tuprs_close", "research_ema_long") and row[
-            "tuprs_close"
+        if _finite(row, "tuprs_signal_close", "research_ema_long") and row[
+            "tuprs_signal_close"
         ] < row["research_ema_long"]:
             return "trend_exit"
         if _finite(row, "rsi_14") and row["rsi_14"] > min(
@@ -321,8 +328,8 @@ class RelativeStrengthStrategy(ResearchStrategy):
     ) -> str | None:
         if _finite(row, "relative_momentum_20d") and row["relative_momentum_20d"] < 0:
             return "relative_strength_exit"
-        if _finite(row, "tuprs_close", "research_ema_medium") and row[
-            "tuprs_close"
+        if _finite(row, "tuprs_signal_close", "research_ema_medium") and row[
+            "tuprs_signal_close"
         ] < row["research_ema_medium"]:
             return "trend_exit"
         return self._maximum_holding_exit(holding_days, config)
@@ -375,6 +382,10 @@ def _mutate_future(frame: pd.DataFrame, cutoff: int) -> pd.DataFrame:
             "tuprs_high",
             "tuprs_low",
             "tuprs_close",
+            "tuprs_signal_open",
+            "tuprs_signal_high",
+            "tuprs_signal_low",
+            "tuprs_signal_close",
             "tuprs_adj_close",
         )
         if column in changed
@@ -449,6 +460,10 @@ def strong_causality_audit(
         "tuprs_high",
         "tuprs_low",
         "tuprs_close",
+        "tuprs_signal_open",
+        "tuprs_signal_high",
+        "tuprs_signal_low",
+        "tuprs_signal_close",
         "tuprs_volume",
         "is_indicator_warmup",
     }.issubset(frame.columns)

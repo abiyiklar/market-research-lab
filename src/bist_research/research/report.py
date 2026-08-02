@@ -137,7 +137,7 @@ def _write_markdown_report(
         "",
         "The engine runs a fixed experiment budget without OOS-driven retuning. Each strategy is tested with rolling 4-year train, 1-year validation, and 1-year OOS windows. Entry and close-based exit signals execute at a later open; intraday stops retain priority. No machine learning is used.",
         "",
-        "The raw-price strategy and raw-price buy-and-hold benchmark are separate from the Adjusted Close total-return benchmark. Adjusted Close reflects Yahoo's dividend and split adjustments and is used only as a benchmark, never as strategy OHLC.",
+        "Strategy indicators use causal total-return-continuous TUPRS signal OHLC while fills remain on unchanged raw OHLC. The raw-price buy-and-hold benchmark remains separate from the Adjusted Close total-return benchmark, which is used only as a benchmark.",
         "",
         "## Top 5",
         "",
@@ -211,9 +211,22 @@ def _write_top_candidates(path: Path, leaderboard: pd.DataFrame) -> None:
     path.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _save_empty_plot(path: Path, title: str) -> None:
+    figure, axis = plt.subplots(figsize=(9, 5))
+    axis.set_title(title)
+    axis.text(0.5, 0.5, "No selected OOS candidates", ha="center", va="center")
+    axis.set_axis_off()
+    figure.tight_layout()
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
 def _plot_robustness_heatmap(
     path: Path, leaderboard: pd.DataFrame, walk_forward: pd.DataFrame
 ) -> None:
+    if leaderboard.empty:
+        _save_empty_plot(path, "Top Candidate OOS Returns (%)")
+        return
     top_ids = leaderboard.head(10)["experiment_id"]
     selected = walk_forward.loc[
         walk_forward["experiment_id"].isin(top_ids) & walk_forward["split"].eq("oos")
@@ -234,6 +247,9 @@ def _plot_robustness_heatmap(
 def _plot_walk_forward_returns(
     path: Path, leaderboard: pd.DataFrame, walk_forward: pd.DataFrame
 ) -> None:
+    if leaderboard.empty:
+        _save_empty_plot(path, "Walk-Forward OOS Returns")
+        return
     figure, axis = plt.subplots(figsize=(12, 6))
     for experiment_id in leaderboard.head(5)["experiment_id"]:
         rows = walk_forward.loc[
@@ -252,6 +268,9 @@ def _plot_walk_forward_returns(
 
 
 def _plot_strategy_comparison(path: Path, leaderboard: pd.DataFrame) -> None:
+    if leaderboard.empty:
+        _save_empty_plot(path, "Median Composite Score by Strategy")
+        return
     comparison = leaderboard.groupby("strategy_name")["composite_score"].median().sort_values()
     figure, axis = plt.subplots(figsize=(9, 5))
     axis.barh(comparison.index, comparison.values, color="#176B87")
@@ -262,6 +281,9 @@ def _plot_strategy_comparison(path: Path, leaderboard: pd.DataFrame) -> None:
 
 
 def _plot_parameter_stability(path: Path, leaderboard: pd.DataFrame) -> None:
+    if leaderboard.empty:
+        _save_empty_plot(path, "Parameter Stability")
+        return
     records = []
     for row in leaderboard.itertuples(index=False):
         parameters = json.loads(row.parameters)

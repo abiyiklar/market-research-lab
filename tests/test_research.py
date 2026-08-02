@@ -154,6 +154,7 @@ def _research_frame(row_count: int = 80) -> pd.DataFrame:
         {
             "date": pd.date_range("2013-01-02", periods=row_count, freq="B"),
             "tuprs_close": 100.0 + index,
+            "tuprs_signal_close": 100.0 + index,
             "xu100_close": 1_000.0 + index,
             "relative_strength_xu100": 1.0 + index / 100,
             "relative_strength_xusin": 1.0 + index / 120,
@@ -194,10 +195,10 @@ def test_breakout_level_uses_only_prior_closes() -> None:
     row_number = 30
 
     assert prepared.loc[row_number, "research_breakout_high"] == prepared.loc[
-        row_number - 20 : row_number - 1, "tuprs_close"
+        row_number - 20 : row_number - 1, "tuprs_signal_close"
     ].max()
     assert prepared.loc[row_number, "research_breakout_high"] < prepared.loc[
-        row_number, "tuprs_close"
+        row_number, "tuprs_signal_close"
     ]
 
 
@@ -269,6 +270,30 @@ def test_scoring_applies_all_hard_gates() -> None:
 
     assert bool(leaderboard.loc[0, "hard_gate_pass"])
     assert leaderboard.loc[0, "decision"] == "preliminary_research_candidate"
+
+
+def test_scoring_preserves_schema_when_no_candidate_is_selected_for_oos() -> None:
+    walk_forward = pd.DataFrame(
+        [
+            {
+                "experiment_id": "train_only",
+                "split": "train",
+                "selected_for_oos": False,
+            }
+        ]
+    )
+
+    leaderboard = score_experiments(walk_forward)
+
+    assert leaderboard.empty
+    assert {
+        "experiment_id",
+        "hard_gate_pass",
+        "statistically_robust",
+        "economically_competitive",
+        "deployment_ready",
+        "composite_score",
+    }.issubset(leaderboard.columns)
 
 
 def test_economic_label_requires_hard_gate_evidence() -> None:
@@ -557,6 +582,10 @@ def test_strong_causality_audit_covers_features_signals_trades_and_equity() -> N
             "tuprs_high": close + 2.0,
             "tuprs_low": close - 2.0,
             "tuprs_close": close + 0.5,
+            "tuprs_signal_open": close,
+            "tuprs_signal_high": close + 2.0,
+            "tuprs_signal_low": close - 2.0,
+            "tuprs_signal_close": close + 0.5,
             "tuprs_adj_close": close + 0.5,
             "tuprs_volume": 10_000.0 + index,
             "xu100_close": 1_000.0 + index,

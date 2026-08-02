@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from bist_research.features import (
     EXTERNAL_MARKETS,
@@ -93,7 +94,7 @@ def test_features_have_expected_windows_and_warmup_marker() -> None:
     assert features["is_indicator_warmup"].sum() == 200
     assert features.loc[199, "is_indicator_warmup"]
     assert not features.loc[200, "is_indicator_warmup"]
-    assert features.loc[20, "relative_momentum_20d"] == 0.0
+    assert features.loc[20, "relative_momentum_20d"] == pytest.approx(0.0, abs=1e-15)
     assert features.loc[19, "volume_average_20d"] == 1_009.5
     assert features.loc[200, "ema_200"] > 0
     assert features.loc[20, "rsi_14"] == 100.0
@@ -110,6 +111,60 @@ def test_changing_future_values_does_not_change_past_features() -> None:
     changed = add_features(changed_input)
 
     pd.testing.assert_frame_equal(original.iloc[:-1], changed.iloc[:-1])
+
+
+def test_signal_return_is_zero_for_a_pure_ex_dividend_price_drop() -> None:
+    source = _feature_input(40)
+    source["dividend_per_share"] = 0.0
+    ex_date = 20
+    previous = source.loc[ex_date - 1, [
+        "tuprs_open",
+        "tuprs_high",
+        "tuprs_low",
+        "tuprs_close",
+    ]]
+    source.loc[
+        ex_date,
+        ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"],
+    ] = previous.to_numpy(dtype="float64") - 10.0
+    source.loc[ex_date, "dividend_per_share"] = 10.0
+
+    features = add_features(source)
+
+    assert features.loc[ex_date, "tuprs_close"] == pytest.approx(
+        features.loc[ex_date - 1, "tuprs_close"] - 10.0
+    )
+    assert features.loc[ex_date, "tuprs_signal_close"] == pytest.approx(
+        features.loc[ex_date - 1, "tuprs_signal_close"]
+    )
+    assert features.loc[ex_date, "tuprs_return_1d"] == pytest.approx(0.0)
+
+
+def test_future_dividend_does_not_change_earlier_signal_features() -> None:
+    source = _feature_input()
+    source["dividend_per_share"] = 0.0
+    expected = add_features(source)
+    changed = source.copy()
+    cutoff = 130
+    changed.loc[cutoff + 1, "dividend_per_share"] = 25.0
+
+    actual = add_features(changed)
+    columns = [
+        "tuprs_signal_open",
+        "tuprs_signal_high",
+        "tuprs_signal_low",
+        "tuprs_signal_close",
+        "tuprs_return_1d",
+        "ema_20",
+        "rsi_14",
+        "atr_14",
+        "relative_strength_xu100",
+        "relative_momentum_20d",
+    ]
+    pd.testing.assert_frame_equal(
+        expected.loc[:cutoff, columns],
+        actual.loc[:cutoff, columns],
+    )
 
 
 def test_multiple_future_market_and_action_mutations_leave_prior_features_unchanged() -> None:

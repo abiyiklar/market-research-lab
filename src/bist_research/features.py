@@ -27,6 +27,10 @@ WARMUP_DAYS = 200
 TRADING_DAYS_PER_YEAR = 252
 
 FEATURE_COLUMNS = (
+    "tuprs_signal_open",
+    "tuprs_signal_high",
+    "tuprs_signal_low",
+    "tuprs_signal_close",
     "tuprs_return_1d",
     "xu100_return_1d",
     "xusin_return_1d",
@@ -48,6 +52,14 @@ FEATURE_COLUMNS = (
     "rsi_14",
     "atr_14",
 )
+
+SIGNAL_PRICE_COLUMNS = (
+    "tuprs_signal_open",
+    "tuprs_signal_high",
+    "tuprs_signal_low",
+    "tuprs_signal_close",
+)
+PRICE_BASIS_UNADJUSTED = "raw_ohlc_unadjusted"
 
 
 @dataclass(frozen=True)
@@ -187,6 +199,48 @@ def _daily_return(series: pd.Series) -> pd.Series:
     return series.pct_change(fill_method=None)
 
 
+def add_tuprs_signal_prices(market_data: pd.DataFrame) -> pd.DataFrame:
+    """Build a causal, split-consistent total-return signal OHLC series."""
+    frame = market_data.copy()
+    raw_columns = ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]
+    missing = sorted(set(raw_columns).difference(frame.columns))
+    if missing:
+        raise ValueError(f"Signal-price input is missing columns: {', '.join(missing)}")
+    if frame.empty:
+        for column in SIGNAL_PRICE_COLUMNS:
+            frame[column] = pd.Series(dtype="float64")
+        return frame
+
+    raw = frame.loc[:, raw_columns].apply(pd.to_numeric, errors="coerce")
+    dividends = pd.to_numeric(
+        frame.get("dividend_per_share", pd.Series(0.0, index=frame.index)),
+        errors="coerce",
+    ).fillna(0.0).clip(lower=0.0)
+    splits = pd.to_numeric(
+        frame.get("stock_split_factor", pd.Series(0.0, index=frame.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    price_basis = frame.get(
+        "price_basis",
+        pd.Series("raw_ohlc_split_basis_unknown", index=frame.index),
+    ).astype(str)
+    split_multiplier = pd.Series(1.0, index=frame.index)
+    unadjusted_split = price_basis.eq(PRICE_BASIS_UNADJUSTED) & splits.gt(0.0)
+    split_multiplier.loc[unadjusted_split] = splits.loc[unadjusted_split]
+
+    previous_raw_close = raw["tuprs_close"].shift(1)
+    total_return_factor = (
+        (raw["tuprs_close"] + dividends) * split_multiplier
+    ) / previous_raw_close
+    total_return_factor.iloc[0] = 1.0
+    signal_close = raw["tuprs_close"].iloc[0] * total_return_factor.cumprod()
+    current_scale = signal_close / raw["tuprs_close"]
+
+    for raw_column, signal_column in zip(raw_columns, SIGNAL_PRICE_COLUMNS, strict=True):
+        frame[signal_column] = raw[raw_column] * current_scale
+    return frame
+
+
 def _relative_momentum(relative_strength: pd.Series, periods: int) -> pd.Series:
     return relative_strength.pct_change(periods=periods, fill_method=None)
 
@@ -204,12 +258,12 @@ def _rsi(close: pd.Series, periods: int = 14) -> pd.Series:
 
 
 def _atr(frame: pd.DataFrame, periods: int = 14) -> pd.Series:
-    previous_close = frame["tuprs_close"].shift(1)
+    previous_close = frame["tuprs_signal_close"].shift(1)
     true_range = pd.concat(
         [
-            frame["tuprs_high"] - frame["tuprs_low"],
-            (frame["tuprs_high"] - previous_close).abs(),
-            (frame["tuprs_low"] - previous_close).abs(),
+            frame["tuprs_signal_high"] - frame["tuprs_signal_low"],
+            (frame["tuprs_signal_high"] - previous_close).abs(),
+            (frame["tuprs_signal_low"] - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
@@ -228,14 +282,16 @@ def add_features(market_data: pd.DataFrame) -> pd.DataFrame:
         if column not in frame:
             frame[column] = default
 
-    frame["tuprs_return_1d"] = _daily_return(frame["tuprs_close"])
+    frame = add_tuprs_signal_prices(frame)
+
+    frame["tuprs_return_1d"] = _daily_return(frame["tuprs_signal_close"])
     frame["xu100_return_1d"] = _daily_return(frame["xu100_close"])
     frame["xusin_return_1d"] = _daily_return(frame["xusin_close"])
     frame["brent_return_1d"] = _daily_return(frame["brent_close"])
     frame["usdtry_return_1d"] = _daily_return(frame["usdtry_close"])
 
-    frame["relative_strength_xu100"] = frame["tuprs_close"] / frame["xu100_close"]
-    frame["relative_strength_xusin"] = frame["tuprs_close"] / frame["xusin_close"]
+    frame["relative_strength_xu100"] = frame["tuprs_signal_close"] / frame["xu100_close"]
+    frame["relative_strength_xusin"] = frame["tuprs_signal_close"] / frame["xusin_close"]
     for periods in (20, 60, 120):
         frame[f"relative_momentum_{periods}d"] = _relative_momentum(
             frame["relative_strength_xu100"], periods
@@ -251,13 +307,13 @@ def add_features(market_data: pd.DataFrame) -> pd.DataFrame:
     frame["volume_ratio_20d"] = frame["tuprs_volume"] / frame["volume_average_20d"].replace(0, float("nan"))
 
     for periods in (20, 50, 100, 200):
-        frame[f"ema_{periods}"] = frame["tuprs_close"].ewm(
+        frame[f"ema_{periods}"] = frame["tuprs_signal_close"].ewm(
             span=periods,
             adjust=False,
             min_periods=periods,
         ).mean()
 
-    frame["rsi_14"] = _rsi(frame["tuprs_close"])
+    frame["rsi_14"] = _rsi(frame["tuprs_signal_close"])
     frame["atr_14"] = _atr(frame)
     frame["is_indicator_warmup"] = pd.Series(range(len(frame)), index=frame.index).lt(WARMUP_DAYS)
     return frame
