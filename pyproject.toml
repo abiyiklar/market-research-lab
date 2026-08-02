@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Python starter collector for BIST market research data."
 requires-python = ">=3.11"
 dependencies = [
+    "matplotlib>=3.9",
+    "numpy>=2.0",
     "pandas>=2.2",
     "yfinance>=0.2.54",
     "pyarrow>=17.0",
@@ -16,6 +18,7 @@ dependencies = [
 [project.scripts]
 bist-collector = "bist_research.collector:main"
 bist-features = "bist_research.features:main"
+bist-backtest = "bist_research.backtest.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
