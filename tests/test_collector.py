@@ -72,6 +72,7 @@ def test_download_symbol_retries_and_normalizes_response() -> None:
                 "Close": [1.1],
                 "Adj Close": [1.1],
                 "Volume": [100],
+                "Repaired?": [True],
             },
             index=pd.DatetimeIndex(["2024-01-01"], name="Date"),
         )
@@ -87,6 +88,8 @@ def test_download_symbol_retries_and_normalizes_response() -> None:
     assert calls == ["TUPRS.IS", "TUPRS.IS"]
     assert frame.iloc[0]["Symbol"] == "TUPRS.IS"
     assert frame.iloc[0]["Close"] == 1.1
+    assert bool(frame.iloc[0]["Repaired"])
+    assert "Repaired?" not in frame.columns
 
 
 def test_download_requests_actions_and_repair_mode() -> None:
@@ -113,7 +116,7 @@ def test_download_requests_actions_and_repair_mode() -> None:
 
     assert captured["actions"] is True
     assert captured["repair"] is True
-    assert {"Dividends", "Stock Splits", "Repaired?"}.issubset(frame.columns)
+    assert {"Dividends", "Stock Splits", "Repaired"}.issubset(frame.columns)
 
 
 def test_corporate_action_history_is_saved_in_separate_directory(tmp_path: Path) -> None:

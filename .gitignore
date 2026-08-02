@@ -61,6 +61,7 @@ logs/
 data/raw/
 data/processed/
 data/features/
+data/quality/
 data/backtest/
 data/research/
 reports/
