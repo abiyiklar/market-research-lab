@@ -49,6 +49,14 @@ Defaults:
 - Collection summary: `data/processed/collection_summary.*`
 - Logs: `logs/collector.log`
 
+Existing raw files are preserved unless `--overwrite-raw` is supplied explicitly. Collect the action-enriched TUPRS history and its audit in a separate derived directory with:
+
+```powershell
+python -m bist_research.collector --actions-only --symbols TUPRS.IS
+```
+
+This writes raw OHLC, Adjusted Close, dividends, stock splits, and the yfinance repaired-data indicator under `data/processed/corporate_actions/` without replacing `data/raw/`.
+
 Optional example:
 
 ```powershell
@@ -65,7 +73,7 @@ Build the analysis dataset from the cleaned Parquet files in `data/processed`:
 python -m bist_research.features
 ```
 
-The pipeline uses TUPRS trading dates as its calendar, left joins the other markets, and only forward-fills external values. All returns and indicators use current and historical observations only. The first 200 TUPRS rows are marked with `is_indicator_warmup`.
+The pipeline uses only tradable TUPRS sessions: positive volume, finite positive OHLC, and internally valid high/low bounds. It left joins the other markets and only forward-fills external values from prior observations. TUPRS prices are never forward-filled. All returns and indicators use current and historical observations only. The first 200 tradable TUPRS sessions are marked with `is_indicator_warmup`.
 
 Outputs:
 
@@ -83,7 +91,7 @@ Run the long-only daily reference strategy from the generated TUPRS feature data
 python -m bist_research.backtest.cli
 ```
 
-The engine calculates signals from daily closes and executes entries at the next eligible open. It excludes indicator warm-up rows, blocks new entries on zero-volume days, uses whole shares without leverage, and applies configurable commission and slippage costs.
+The engine calculates signals from daily closes and executes entries at the next eligible tradable open. Pending entries and exits carry across non-tradable rows; holding days, stops, and period liquidation use the same tradable-session calendar. It uses whole shares without leverage and applies configurable commission and slippage costs.
 
 Baseline V1 keeps its parameters fixed: the XU100 daily-return floor is `-3%`, the entry RSI range is `50-72`, the minimum volume ratio is `1.10`, the initial ATR stop is `2.5x`, the trailing ATR stop is `3.0x`, and the maximum holding period is 60 trading days. Close-based exits are signaled at the close and filled at the next trading day's open. Intraday stops use levels known before that day's low is tested; gap stops fill at the open and normal stops fill at the stop level.
 
@@ -102,7 +110,7 @@ python -m bist_research.backtest.cli `
 
 The command writes trade, daily-equity, metric, period, benchmark, drawdown, and corporate-action data-quality tables to `data/backtest/`. The Markdown report and equity, drawdown, annual-return, trade-return, and benchmark charts are written to `reports/`.
 
-The strategy uses raw TUPRS OHLC for signals and execution. The benchmark table reports `tuprs_raw_buy_hold` separately from `tuprs_adjusted_total_return`. The adjusted benchmark uses Yahoo Adjusted Close as a return index, which reflects dividend and split adjustments; adjusted OHLC is not used to run the strategy.
+The strategy uses raw TUPRS OHLC for signals, stops, and execution. Reported cash dividends are credited while long, net of the configurable `--dividend-withholding-rate` (default `0`). Yahoo TUPRS raw OHLC is audited around reported splits before any quantity treatment; split-adjusted prices are not adjusted a second time. The benchmark table reports raw buy-and-hold, explicit-dividend total return, and Yahoo Adjusted Close total return separately.
 
 ## Run Controlled Strategy Research
 
@@ -112,7 +120,7 @@ Run the deterministic research engine with its default cap of 150 experiments:
 python -m bist_research.research.cli
 ```
 
-The engine evaluates `baseline_v1_fixed`, `trend_following`, `breakout`, `pullback_in_uptrend`, and `relative_strength` families. It uses rolling 4-year train, 1-year validation, and 1-year out-of-sample windows. Candidate ranking combines OOS CAGR, profit factor, Sharpe ratio, drawdown, result dispersion, benchmark excess, and trade adequacy. OOS results are never used to generate or retune parameters.
+The engine evaluates `baseline_v1_fixed`, `trend_following`, `breakout`, `pullback_in_uptrend`, and `relative_strength` families. For each rolling 4-year train, 1-year validation, and 1-year OOS window, train quality gates are applied first and surviving candidates are ranked only on validation. At most one candidate per family (up to five total) is frozen and run exactly once on that window's OOS period. Only these selected OOS runs feed the final leaderboard.
 
 Bounded example:
 
@@ -125,12 +133,15 @@ python -m bist_research.research.cli `
   --report-dir reports
 ```
 
-The best 10 experiments receive doubled-cost, parameter perturbation, start-offset, best-trade-removal, delayed-entry, and deterministic signal-skip stress tests. The same candidates receive one-filter-at-a-time ablation for market regime, volume, RSI, relative strength, trend, oil, and USDTRY filters.
+The best 10 selected-OOS candidates receive doubled-cost, parameter perturbation, start-offset, best-trade-removal, delayed-entry, and deterministic signal-skip stress tests. Best-trade removal disables the original signal date and reruns the full engine. Ablation is diagnostic and runs only on train/validation data; it is not used to retune OOS candidates.
 
-Research CSV files are appended by deterministic experiment keys so prior experiment rows are retained. Reports include the leaderboard, top-candidate summary, robustness heatmap, walk-forward returns, family comparison, and parameter-stability chart. No machine learning or open-ended "search until good" loop is used.
+Decision fields are reported separately as `hard_gate_pass`, `stress_stability_pass`, `statistically_robust`, `economically_competitive`, and `deployment_ready`. Historical candidates remain `deployment_ready=False` until forward paper trading is completed. A statistically stable candidate with insufficient benchmark-relative economic value remains a preliminary research candidate.
+
+Each research run replaces the current derived CSV outputs so legacy non-nested OOS rows cannot remain mixed with valid evidence. Reports include the leaderboard, top-candidate summary, robustness heatmap, walk-forward returns, family comparison, and parameter-stability chart. No machine learning or open-ended "search until good" loop is used.
 
 ## Tests
 
 ```powershell
-python -m pytest
+python -m pytest -q
+python -m pip check
 ```

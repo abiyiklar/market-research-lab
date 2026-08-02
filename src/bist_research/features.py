@@ -7,6 +7,8 @@ from typing import Mapping, Sequence
 
 import pandas as pd
 
+from .trading_calendar import only_tradable_tuprs_sessions
+
 
 MARKET_FILES: Mapping[str, str] = {
     "tuprs": "TUPRS.IS.parquet",
@@ -20,6 +22,7 @@ MARKET_FILES: Mapping[str, str] = {
 
 MARKET_VALUE_COLUMNS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
 EXTERNAL_MARKETS = tuple(market for market in MARKET_FILES if market != "tuprs")
+CORPORATE_ACTION_FILE = Path("corporate_actions/TUPRS.IS_actions.parquet")
 WARMUP_DAYS = 200
 TRADING_DAYS_PER_YEAR = 252
 
@@ -62,7 +65,7 @@ def _load_market_frame(processed_dir: Path, market: str) -> pd.DataFrame:
     frame = pd.read_parquet(path)
     required_columns = {"Date", "Close"}
     if market == "tuprs":
-        required_columns.update({"High", "Low", "Volume"})
+        required_columns.update({"Open", "High", "Low", "Volume"})
 
     missing_columns = required_columns.difference(frame.columns)
     if missing_columns:
@@ -90,11 +93,56 @@ def _prefix_market_columns(frame: pd.DataFrame, market: str) -> pd.DataFrame:
     return frame[selected_columns].rename(columns=rename_map)
 
 
+def _load_corporate_actions(processed_dir: Path) -> pd.DataFrame:
+    path = processed_dir / CORPORATE_ACTION_FILE
+    columns = [
+        "date",
+        "dividend_per_share",
+        "stock_split_factor",
+        "repaired_data",
+        "corporate_action_flag",
+        "price_basis",
+    ]
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+
+    actions = pd.read_parquet(path).copy()
+    if "Date" not in actions:
+        raise ValueError(f"{path.name} is missing required column: Date")
+    actions["date"] = pd.to_datetime(actions["Date"], errors="raise").dt.normalize()
+    dividends = pd.to_numeric(
+        actions.get("Dividends", pd.Series(0.0, index=actions.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    splits = pd.to_numeric(
+        actions.get("Stock Splits", pd.Series(0.0, index=actions.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    repaired = actions.get("Repaired?", pd.Series(False, index=actions.index)).fillna(False)
+    price_basis = actions.get(
+        "price_basis",
+        pd.Series("raw_ohlc_split_basis_unknown", index=actions.index),
+    )
+    prepared = pd.DataFrame(
+        {
+            "date": actions["date"],
+            "dividend_per_share": dividends,
+            "stock_split_factor": splits,
+            "repaired_data": repaired.astype(bool),
+            "corporate_action_flag": dividends.ne(0) | splits.ne(0),
+            "price_basis": price_basis.astype(str),
+        }
+    )
+    if prepared["date"].duplicated().any():
+        raise ValueError(f"{path.name} contains duplicate dates")
+    return prepared.sort_values("date").reset_index(drop=True)
+
+
 def merge_processed_markets(
     processed_dir: Path = Path("data/processed"),
 ) -> tuple[pd.DataFrame, dict[str, dict[str, int]]]:
     tuprs = _prefix_market_columns(_load_market_frame(processed_dir, "tuprs"), "tuprs")
-    merged = tuprs.sort_values("date").reset_index(drop=True)
+    merged = only_tradable_tuprs_sessions(tuprs)
     fill_stats: dict[str, dict[str, int]] = {}
 
     for market in EXTERNAL_MARKETS:
@@ -115,6 +163,22 @@ def merge_processed_markets(
             "missing_close_before_fill": missing_before,
             "missing_close_after_fill": int(merged[close_column].isna().sum()),
         }
+
+    actions = _load_corporate_actions(processed_dir)
+    merged = merged.merge(actions, on="date", how="left", sort=False, validate="one_to_one")
+    merged["dividend_per_share"] = merged["dividend_per_share"].fillna(0.0)
+    merged["stock_split_factor"] = merged["stock_split_factor"].fillna(0.0)
+    merged["repaired_data"] = merged["repaired_data"].fillna(False).astype(bool)
+    merged["corporate_action_flag"] = (
+        merged["corporate_action_flag"].fillna(False).astype(bool)
+    )
+    observed_basis = actions["price_basis"].dropna()
+    default_basis = (
+        str(observed_basis.iloc[0])
+        if not observed_basis.empty
+        else "raw_ohlc_split_basis_unknown"
+    )
+    merged["price_basis"] = merged["price_basis"].fillna(default_basis)
 
     return merged, fill_stats
 
@@ -153,7 +217,16 @@ def _atr(frame: pd.DataFrame, periods: int = 14) -> pd.Series:
 
 
 def add_features(market_data: pd.DataFrame) -> pd.DataFrame:
-    frame = market_data.sort_values("date").reset_index(drop=True).copy()
+    frame = only_tradable_tuprs_sessions(market_data)
+    for column, default in (
+        ("dividend_per_share", 0.0),
+        ("stock_split_factor", 0.0),
+        ("repaired_data", False),
+        ("corporate_action_flag", False),
+        ("price_basis", "raw_ohlc_split_basis_unknown"),
+    ):
+        if column not in frame:
+            frame[column] = default
 
     frame["tuprs_return_1d"] = _daily_return(frame["tuprs_close"])
     frame["xu100_return_1d"] = _daily_return(frame["xu100_close"])
@@ -207,6 +280,16 @@ def build_quality_summary(
             "category": "dataset",
             "metric": "indicator_warmup_rows",
             "value": int(features["is_indicator_warmup"].sum()),
+        },
+        {
+            "category": "dataset",
+            "metric": "corporate_action_rows",
+            "value": int(features["corporate_action_flag"].sum()),
+        },
+        {
+            "category": "dataset",
+            "metric": "repaired_rows",
+            "value": int(features["repaired_data"].sum()),
         },
     ]
 

@@ -51,6 +51,7 @@ def _feature_input(row_count: int = 260) -> pd.DataFrame:
     frame = pd.DataFrame(
         {
             "date": dates,
+            "tuprs_open": 100.0 + index,
             "tuprs_close": 100.0 + index,
             "tuprs_high": 101.0 + index,
             "tuprs_low": 99.0 + index,
@@ -109,6 +110,68 @@ def test_changing_future_values_does_not_change_past_features() -> None:
     changed = add_features(changed_input)
 
     pd.testing.assert_frame_equal(original.iloc[:-1], changed.iloc[:-1])
+
+
+def test_multiple_future_market_and_action_mutations_leave_prior_features_unchanged() -> None:
+    source = _feature_input()
+    source["dividend_per_share"] = 0.0
+    source["stock_split_factor"] = 0.0
+    source["corporate_action_flag"] = False
+    source["price_basis"] = "raw_ohlc_split_adjusted"
+    expected = add_features(source)
+
+    for cutoff in (60, 130, 210):
+        changed = source.copy()
+        future = changed.index[cutoff + 1 :]
+        changed.loc[
+            future,
+            ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"],
+        ] *= 1.7
+        changed.loc[future, "tuprs_volume"] *= 3.0
+        changed.loc[
+            future,
+            ["xu100_close", "xusin_close", "brent_close", "usdtry_close"],
+        ] *= 2.2
+        changed.loc[future, "dividend_per_share"] = 9.0
+        changed.loc[future, "stock_split_factor"] = 3.0
+        changed.loc[future, "corporate_action_flag"] = True
+
+        actual = add_features(changed)
+
+        pd.testing.assert_frame_equal(
+            expected.iloc[: cutoff + 1].reset_index(drop=True),
+            actual.iloc[: cutoff + 1].reset_index(drop=True),
+        )
+
+
+def test_zero_volume_rows_do_not_affect_technical_features() -> None:
+    source = _feature_input()
+    zero_volume = source.iloc[[120]].copy()
+    zero_volume["date"] = zero_volume["date"] + pd.Timedelta(hours=12)
+    zero_volume["tuprs_open"] = 900.0
+    zero_volume["tuprs_high"] = 910.0
+    zero_volume["tuprs_low"] = 890.0
+    zero_volume["tuprs_close"] = 905.0
+    zero_volume["tuprs_volume"] = 0.0
+    with_zero = pd.concat([source, zero_volume], ignore_index=True).sort_values("date")
+
+    expected = add_features(source)
+    actual = add_features(with_zero)
+
+    columns = [
+        "date",
+        "ema_20",
+        "ema_50",
+        "ema_100",
+        "ema_200",
+        "rsi_14",
+        "atr_14",
+        "relative_momentum_20d",
+        "relative_momentum_60d",
+        "relative_momentum_120d",
+    ]
+    pd.testing.assert_frame_equal(actual[columns], expected[columns])
+    assert actual["tuprs_volume"].gt(0).all()
 
 
 def test_pipeline_saves_features_and_quality_summary(tmp_path: Path) -> None:

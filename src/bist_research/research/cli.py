@@ -26,7 +26,7 @@ from .stress_tests import run_stress_tests, stress_summary
 from .walk_forward import (
     generate_walk_forward_windows,
     run_full_experiment,
-    run_walk_forward_experiment,
+    run_nested_walk_forward,
 )
 
 
@@ -59,7 +59,11 @@ def configure_logging(log_dir: Path = Path("logs")) -> logging.Logger:
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run controlled TUPRS strategy research.")
-    parser.add_argument("--input", type=Path, default=Path("data/features/tuprs_features.parquet"))
+    parser.add_argument(
+        "--input",
+        type=Path,
+        default=Path("data/features/tuprs_features.parquet"),
+    )
     parser.add_argument("--max-experiments", type=int, default=MAX_EXPERIMENTS)
     parser.add_argument("--random-seed", type=int, default=DEFAULT_RANDOM_SEED)
     parser.add_argument("--strategy", nargs="+", choices=STRATEGY_NAMES)
@@ -89,7 +93,7 @@ def run_research_pipeline(
     base_config = BacktestConfig()
     windows = generate_walk_forward_windows(frame)
     experiment_rows: list[dict[str, object]] = []
-    walk_rows: list[dict[str, object]] = []
+    causality_results: dict[str, bool] = {}
     for index, experiment in enumerate(experiments, start=1):
         active_logger.info(
             "Experiment %s/%s: %s (%s)",
@@ -100,11 +104,18 @@ def run_research_pipeline(
         )
         full_row, _ = run_full_experiment(frame, experiment, base_config)
         experiment_rows.append(full_row)
-        walk_rows.extend(
-            run_walk_forward_experiment(frame, experiment, base_config, windows)
-        )
+        causality_results[experiment.experiment_id] = bool(full_row["lookahead_pass"])
     experiment_results = pd.DataFrame(experiment_rows)
-    walk_forward = pd.DataFrame(walk_rows)
+    active_logger.info("Nested walk-forward selection across %s windows", len(windows))
+    walk_forward = pd.DataFrame(
+        run_nested_walk_forward(
+            frame,
+            experiments,
+            base_config,
+            windows,
+            causality_results=causality_results,
+        )
+    )
     leaderboard = score_experiments(walk_forward)
     experiment_map: dict[str, Experiment] = {
         experiment.experiment_id: experiment for experiment in experiments
@@ -112,6 +123,7 @@ def run_research_pipeline(
     stress_tests = run_stress_tests(
         frame,
         leaderboard,
+        walk_forward,
         experiment_map,
         base_config,
         random_seed,
@@ -123,6 +135,7 @@ def run_research_pipeline(
     ablation = run_ablation_analysis(
         frame,
         leaderboard,
+        walk_forward,
         experiment_map,
         base_config,
     )
@@ -163,6 +176,8 @@ def _terminal_table(leaderboard: pd.DataFrame) -> str:
         "worst_drawdown",
         "stress_test_result",
         "stability_class",
+        "economically_competitive",
+        "deployment_ready",
         "composite_score",
         "decision",
     ]
@@ -187,11 +202,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 1
     print("Top 10 strategy candidates")
     print(_terminal_table(result.leaderboard))
-    robust = int(result.leaderboard["decision"].eq("robust_candidate").sum())
-    if robust == 0:
-        print("robust candidate bulunamadı")
-    else:
-        print(f"Robust candidates: {robust}")
+    robust = int(result.leaderboard["statistically_robust"].sum())
+    competitive = int(result.leaderboard["economically_competitive"].sum())
+    print(f"Statistically robust candidates: {robust}")
+    print(f"Economically competitive candidates: {competitive}")
+    if competitive == 0:
+        print("No economically competitive candidate was found.")
+    if robust:
+        print(f"Statistically robust historical candidates: {robust}")
     print(f"Report: {result.artifacts.research_report}")
     return 0
 

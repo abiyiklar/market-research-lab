@@ -80,23 +80,11 @@ def write_research_outputs(
         strategy_comparison=report_dir / "strategy_comparison.png",
         parameter_stability=report_dir / "parameter_stability.png",
     )
-    append_csv(artifacts.experiment_results, experiment_results, ["experiment_id"])
-    append_csv(
-        artifacts.walk_forward_results,
-        walk_forward_results,
-        ["experiment_id", "window_id", "split"],
-    )
-    append_csv(
-        artifacts.stress_test_results,
-        stress_results,
-        ["experiment_id", "scenario"],
-    )
-    append_csv(
-        artifacts.ablation_results,
-        ablation_results,
-        ["experiment_id", "removed_filter"],
-    )
-    append_csv(artifacts.candidate_parameters, leaderboard, ["experiment_id"])
+    experiment_results.to_csv(artifacts.experiment_results, index=False)
+    walk_forward_results.to_csv(artifacts.walk_forward_results, index=False)
+    stress_results.to_csv(artifacts.stress_test_results, index=False)
+    ablation_results.to_csv(artifacts.ablation_results, index=False)
+    leaderboard.to_csv(artifacts.candidate_parameters, index=False)
     leaderboard.to_csv(artifacts.research_leaderboard, index=False)
     _write_markdown_report(
         artifacts.research_report,
@@ -130,7 +118,8 @@ def _write_markdown_report(
     random_seed: int,
     git_commit: str,
 ) -> None:
-    robust_count = int(leaderboard["decision"].eq("robust_candidate").sum())
+    robust_count = int(leaderboard["statistically_robust"].sum())
+    economic_count = int(leaderboard["economically_competitive"].sum())
     hard_gate_count = int(leaderboard["hard_gate_pass"].sum())
     lines = [
         "# TUPRS Strategy Research Report",
@@ -140,6 +129,9 @@ def _write_markdown_report(
         f"Git commit: `{git_commit}`",
         f"Experiments in this run: {len(leaderboard)}",
         f"Hard-gate passes: {hard_gate_count}",
+        f"Statistically robust candidates: {robust_count}",
+        f"Economically competitive candidates: {economic_count}",
+        "Deployment-ready candidates: 0 (forward paper trading is required)",
         "",
         "## Methodology",
         "",
@@ -159,7 +151,10 @@ def _write_markdown_report(
             f"{row.median_profit_factor:.2f} | {_percent(row.worst_drawdown)} | "
             f"{row.stability_class} | {row.composite_score:.3f} | {row.decision}"
         )
-    oos = walk_forward.loc[walk_forward["split"].eq("oos")]
+    oos = walk_forward.loc[
+        walk_forward["split"].eq("oos")
+        & walk_forward["selected_for_oos"].astype(bool)
+    ]
     lines.extend(
         [
             "",
@@ -179,9 +174,14 @@ def _write_markdown_report(
         lines.append(f"- {stability}: {count}")
     lines.extend(["", "## Research Decision", ""])
     if robust_count:
-        lines.append(f"{robust_count} strategy is classified as a robust candidate.")
+        lines.append(f"{robust_count} strategy is statistically robust historical research.")
     else:
-        lines.append("robust candidate bulunamadı")
+        lines.append("No statistically robust candidate was found.")
+    if economic_count:
+        lines.append(f"{economic_count} strategy passes the documented economic-value test.")
+    else:
+        lines.append("No economically competitive candidate was found.")
+    lines.append("No candidate is deployment-ready before forward paper trading.")
     lines.append("")
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -201,6 +201,8 @@ def _write_top_candidates(path: Path, leaderboard: pd.DataFrame) -> None:
                 f"- Median profit factor: {row.median_profit_factor:.3f}",
                 f"- Worst drawdown: {_percent(row.worst_drawdown)}",
                 f"- Stress/stability: {row.stress_test_result} / {row.stability_class}",
+                f"- Economically competitive: {row.economically_competitive}",
+                f"- Deployment ready: {row.deployment_ready}",
                 f"- Composite score: {row.composite_score:.3f}",
                 f"- Decision: {row.decision}",
                 "",

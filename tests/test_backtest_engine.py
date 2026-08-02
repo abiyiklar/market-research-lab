@@ -49,7 +49,12 @@ def _zero_cost_config(**overrides: object) -> BacktestConfig:
 def test_signal_enters_next_day_open_not_same_day_close() -> None:
     frame = _engine_frame(3)
     frame.loc[0, "force_signal"] = True
-    frame.loc[0, "tuprs_close"] = 90.0
+    frame.loc[0, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
+        90.0,
+        92.0,
+        88.0,
+        90.0,
+    ]
     frame.loc[1, "tuprs_open"] = 105.0
     frame.loc[1, "tuprs_high"] = 107.0
     frame.loc[1, "tuprs_low"] = 103.0
@@ -151,15 +156,16 @@ def test_commission_slippage_and_whole_share_quantity() -> None:
     assert trade["slippage_cost"] == pytest.approx(18.9)
 
 
-def test_zero_volume_execution_day_does_not_open_trade() -> None:
+def test_zero_volume_execution_day_carries_entry_to_next_tradable_open() -> None:
     frame = _engine_frame(3)
     frame.loc[0, "force_signal"] = True
     frame.loc[1, "tuprs_volume"] = 0
 
     result = BacktestEngine(_zero_cost_config(), _forced_signal).run(frame)
 
-    assert result.trades.empty
-    assert not result.daily_equity["position_open"].any()
+    assert len(result.trades) == 1
+    assert result.trades.iloc[0]["entry_date"] == frame.loc[2, "date"]
+    assert frame.loc[1, "date"] not in result.daily_equity["date"].tolist()
 
 
 def test_warmup_signal_is_not_used() -> None:
@@ -234,7 +240,7 @@ def test_future_price_change_does_not_change_prior_equity() -> None:
 def test_close_exit_signal_executes_at_next_open() -> None:
     frame = _engine_frame(4)
     frame.loc[0, ["force_signal", "atr_14"]] = [True, 10.0]
-    frame.loc[1, ["tuprs_close", "ema_50"]] = [95.0, 98.0]
+    frame.loc[1, ["tuprs_low", "tuprs_close", "ema_50"]] = [94.0, 95.0, 98.0]
     frame.loc[2, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
         96.0,
         98.0,
@@ -255,7 +261,7 @@ def test_pending_exit_does_not_schedule_a_new_entry() -> None:
     frame = _engine_frame(5)
     frame.loc[0:1, "force_signal"] = True
     frame.loc[0, "atr_14"] = 10.0
-    frame.loc[1, ["tuprs_close", "ema_50"]] = [95.0, 98.0]
+    frame.loc[1, ["tuprs_low", "tuprs_close", "ema_50"]] = [94.0, 95.0, 98.0]
 
     result = BacktestEngine(_zero_cost_config(), _forced_signal).run(frame)
 
@@ -266,7 +272,7 @@ def test_pending_exit_does_not_schedule_a_new_entry() -> None:
 def test_gap_stop_has_priority_over_pending_exit() -> None:
     frame = _engine_frame(4)
     frame.loc[0, ["force_signal", "atr_14"]] = [True, 4.0]
-    frame.loc[1, ["tuprs_low", "tuprs_close", "ema_50", "atr_14"]] = [96.0, 95.0, 98.0, 10.0]
+    frame.loc[1, ["tuprs_low", "tuprs_close", "ema_50", "atr_14"]] = [94.0, 95.0, 98.0, 10.0]
     frame.loc[2, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
         85.0,
         88.0,
@@ -302,7 +308,7 @@ def test_last_day_open_position_closes_at_period_end_close() -> None:
 def test_future_close_change_does_not_change_prior_exit_decision() -> None:
     frame = _engine_frame(5)
     frame.loc[0, ["force_signal", "atr_14"]] = [True, 20.0]
-    frame.loc[1, ["tuprs_close", "ema_50"]] = [95.0, 98.0]
+    frame.loc[1, ["tuprs_low", "tuprs_close", "ema_50"]] = [94.0, 95.0, 98.0]
     changed = frame.copy()
     changed.loc[2, "tuprs_close"] = 500.0
     changed.loc[2, "tuprs_high"] = 510.0
@@ -313,3 +319,49 @@ def test_future_close_change_does_not_change_prior_exit_decision() -> None:
     assert original["exit_date"] == future_changed["exit_date"]
     assert original["exit_price_raw"] == future_changed["exit_price_raw"]
     assert original["exit_reason"] == future_changed["exit_reason"]
+
+
+def test_pending_close_exit_skips_zero_volume_row() -> None:
+    frame = _engine_frame(5)
+    frame.loc[0, ["force_signal", "atr_14"]] = [True, 20.0]
+    frame.loc[1, ["tuprs_low", "tuprs_close", "ema_50"]] = [94.0, 95.0, 98.0]
+    frame.loc[2, "tuprs_volume"] = 0.0
+    frame.loc[3, ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]] = [
+        97.0,
+        99.0,
+        96.0,
+        98.0,
+    ]
+
+    result = BacktestEngine(_zero_cost_config(), _forced_signal).run(frame)
+    trade = result.trades.iloc[0]
+
+    assert trade["exit_date"] == frame.loc[3, "date"]
+    assert trade["exit_price_raw"] == 97.0
+    assert frame.loc[2, "date"] not in result.daily_equity["date"].tolist()
+
+
+def test_holding_days_count_only_tradable_sessions() -> None:
+    frame = _engine_frame(6)
+    frame.loc[0, ["force_signal", "atr_14"]] = [True, 20.0]
+    frame.loc[2, "tuprs_volume"] = 0.0
+    config = _zero_cost_config(maximum_holding_days=2)
+
+    result = BacktestEngine(config, _forced_signal).run(frame)
+    trade = result.trades.iloc[0]
+
+    assert trade["holding_days"] == 3
+    assert trade["exit_date"] == frame.loc[4, "date"]
+    assert frame.loc[2, "date"] not in result.daily_equity["date"].tolist()
+
+
+def test_no_trade_uses_a_zero_volume_execution_date() -> None:
+    frame = _engine_frame(7)
+    frame.loc[[0, 3], "force_signal"] = True
+    frame.loc[[1, 4], "tuprs_volume"] = 0.0
+
+    result = BacktestEngine(_zero_cost_config(maximum_holding_days=2), _forced_signal).run(frame)
+    zero_dates = set(frame.loc[frame["tuprs_volume"].eq(0), "date"])
+
+    assert not set(result.trades["entry_date"]).intersection(zero_dates)
+    assert not set(result.trades["exit_date"]).intersection(zero_dates)

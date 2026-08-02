@@ -20,6 +20,11 @@ TRADE_COLUMNS = (
     "exit_reason",
     "exit_commission",
     "slippage_cost",
+    "dividend_cash",
+    "cumulative_dividend_cash",
+    "stock_split_factor",
+    "corporate_action_flag",
+    "price_basis",
     "gross_pnl",
     "net_pnl",
     "return_pct",
@@ -40,6 +45,12 @@ EQUITY_COLUMNS = (
     "drawdown",
     "position_open",
     "current_stop",
+    "dividend_per_share",
+    "dividend_cash",
+    "cumulative_dividend_cash",
+    "stock_split_factor",
+    "corporate_action_flag",
+    "price_basis",
 )
 
 
@@ -60,6 +71,7 @@ class BacktestConfig:
     risk_free_rate: float = 0.0
     trading_days_per_year: int = 252
     entry_delay_days: int = 1
+    dividend_withholding_rate: float = 0.0
 
     def __post_init__(self) -> None:
         if self.initial_capital <= 0:
@@ -80,6 +92,8 @@ class BacktestConfig:
             raise ValueError("trading_days_per_year must be positive")
         if self.entry_delay_days <= 0:
             raise ValueError("entry_delay_days must be positive")
+        if not 0 <= self.dividend_withholding_rate < 1:
+            raise ValueError("dividend_withholding_rate must be between 0 and 1")
 
 
 @dataclass(frozen=True)
@@ -110,6 +124,10 @@ class Position:
     maximum_price: float
     minimum_price: float
     holding_days: int = 0
+    cumulative_dividend_cash: float = 0.0
+    cumulative_stock_split_factor: float = 1.0
+    corporate_action_flag: bool = False
+    price_basis: str = "raw_ohlc_split_basis_unknown"
 
 
 @dataclass(frozen=True)
@@ -128,6 +146,11 @@ class Trade:
     exit_reason: str
     exit_commission: float
     slippage_cost: float
+    dividend_cash: float
+    cumulative_dividend_cash: float
+    stock_split_factor: float
+    corporate_action_flag: bool
+    price_basis: str
     gross_pnl: float
     net_pnl: float
     return_pct: float

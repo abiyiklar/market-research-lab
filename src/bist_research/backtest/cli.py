@@ -50,6 +50,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--initial-capital", type=float, default=100_000.0)
     parser.add_argument("--commission-rate", type=float, default=0.001)
     parser.add_argument("--slippage-rate", type=float, default=0.0005)
+    parser.add_argument("--dividend-withholding-rate", type=float, default=0.0)
     return parser.parse_args(argv)
 
 
@@ -61,6 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             initial_capital=args.initial_capital,
             commission_rate=args.commission_rate,
             slippage_rate=args.slippage_rate,
+            dividend_withholding_rate=args.dividend_withholding_rate,
         )
         result = run_backtest_pipeline(
             input_path=args.input,

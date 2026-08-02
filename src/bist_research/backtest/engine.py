@@ -8,6 +8,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from bist_research.trading_calendar import only_tradable_tuprs_sessions
+
+from .corporate_actions import PRICE_BASIS_UNADJUSTED
 from .models import (
     EQUITY_COLUMNS,
     TRADE_COLUMNS,
@@ -65,6 +68,16 @@ def validate_feature_data(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"Feature dataset is missing required columns: {', '.join(missing)}")
 
     validated = frame.copy()
+    optional_defaults: dict[str, object] = {
+        "dividend_per_share": 0.0,
+        "stock_split_factor": 0.0,
+        "repaired_data": False,
+        "corporate_action_flag": False,
+        "price_basis": "raw_ohlc_split_basis_unknown",
+    }
+    for column, default in optional_defaults.items():
+        if column not in validated:
+            validated[column] = default
     validated["date"] = pd.to_datetime(validated["date"], errors="raise").dt.normalize()
     validated = validated.sort_values("date").reset_index(drop=True)
     if validated["date"].duplicated().any():
@@ -72,6 +85,8 @@ def validate_feature_data(frame: pd.DataFrame) -> pd.DataFrame:
     if validated["is_indicator_warmup"].isna().any():
         raise ValueError("is_indicator_warmup contains missing values")
 
+    validated = only_tradable_tuprs_sessions(validated)
+    validated["is_tradable_tuprs_session"] = True
     active = validated.loc[~validated["is_indicator_warmup"].astype(bool)]
     if active.empty:
         raise ValueError("Feature dataset has no rows outside the indicator warm-up period")
@@ -109,10 +124,18 @@ class BacktestEngine:
         pending_exit: PendingExit | None = None
         trades: list[Trade] = []
         equity_rows: list[dict[str, object]] = []
+        cumulative_dividend_cash = 0.0
 
         for row_number, row in rows.iterrows():
             date = pd.Timestamp(row["date"])
             is_last_row = row_number == len(rows) - 1
+            dividend_cash = 0.0
+
+            if position is not None:
+                self._apply_stock_split(position, row)
+                dividend_cash = self._credit_dividend(position, row)
+                cash += dividend_cash
+                cumulative_dividend_cash += dividend_cash
 
             if position is None and pending_entry is not None:
                 if pending_entry.sessions_until_entry <= 1:
@@ -204,7 +227,15 @@ class BacktestEngine:
                     self.config.entry_delay_days,
                 )
 
-            equity_rows.append(self._equity_row(row, cash, position))
+            equity_rows.append(
+                self._equity_row(
+                    row,
+                    cash,
+                    position,
+                    dividend_cash,
+                    cumulative_dividend_cash,
+                )
+            )
 
         trade_frame = pd.DataFrame((trade.to_dict() for trade in trades), columns=TRADE_COLUMNS)
         equity_frame = self._finalize_equity(pd.DataFrame(equity_rows))
@@ -254,6 +285,7 @@ class BacktestEngine:
             highest_close=raw_price,
             maximum_price=raw_price,
             minimum_price=raw_price,
+            price_basis=str(row.get("price_basis", "raw_ohlc_split_basis_unknown")),
         )
         self.logger.debug(
             "Opened trade %s on %s at %.4f for %s shares",
@@ -281,11 +313,15 @@ class BacktestEngine:
         )
         exit_slippage = position.quantity * (raw_price - effective_price)
         slippage_cost = entry_slippage + exit_slippage
-        gross_pnl = position.quantity * (raw_price - position.entry_price_raw)
+        gross_pnl = (
+            position.quantity * (raw_price - position.entry_price_raw)
+            + position.cumulative_dividend_cash
+        )
         net_pnl = (
             position.quantity * (effective_price - position.entry_price_effective)
             - position.entry_commission
             - exit_commission
+            + position.cumulative_dividend_cash
         )
         invested_capital = (
             position.quantity * position.entry_price_effective + position.entry_commission
@@ -309,6 +345,11 @@ class BacktestEngine:
             exit_reason=reason,
             exit_commission=exit_commission,
             slippage_cost=slippage_cost,
+            dividend_cash=position.cumulative_dividend_cash,
+            cumulative_dividend_cash=position.cumulative_dividend_cash,
+            stock_split_factor=position.cumulative_stock_split_factor,
+            corporate_action_flag=position.corporate_action_flag,
+            price_basis=position.price_basis,
             gross_pnl=gross_pnl,
             net_pnl=net_pnl,
             return_pct=trade_return,
@@ -343,11 +384,45 @@ class BacktestEngine:
             else "atr_stop"
         )
 
+    def _credit_dividend(self, position: Position, row: pd.Series) -> float:
+        per_share = float(row.get("dividend_per_share", 0.0) or 0.0)
+        if not math.isfinite(per_share) or per_share <= 0:
+            return 0.0
+        cash = (
+            position.quantity
+            * per_share
+            * (1 - self.config.dividend_withholding_rate)
+        )
+        position.cumulative_dividend_cash += cash
+        position.corporate_action_flag = True
+        return cash
+
+    @staticmethod
+    def _apply_stock_split(position: Position, row: pd.Series) -> None:
+        factor = float(row.get("stock_split_factor", 0.0) or 0.0)
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        position.corporate_action_flag = True
+        if str(row.get("price_basis", position.price_basis)) != PRICE_BASIS_UNADJUSTED:
+            return
+        position.quantity = int(round(position.quantity * factor))
+        position.entry_price_raw /= factor
+        position.entry_price_effective /= factor
+        position.initial_stop /= factor
+        position.current_stop /= factor
+        position.highest_close /= factor
+        position.maximum_price /= factor
+        position.minimum_price /= factor
+        position.cumulative_stock_split_factor *= factor
+        position.price_basis = PRICE_BASIS_UNADJUSTED
+
     @staticmethod
     def _equity_row(
         row: pd.Series,
         cash: float,
         position: Position | None,
+        dividend_cash: float,
+        cumulative_dividend_cash: float,
     ) -> dict[str, object]:
         quantity = position.quantity if position is not None else 0
         market_value = quantity * float(row["tuprs_close"])
@@ -359,6 +434,12 @@ class BacktestEngine:
             "total_equity": cash + market_value,
             "position_open": position is not None,
             "current_stop": position.current_stop if position is not None else 0.0,
+            "dividend_per_share": float(row.get("dividend_per_share", 0.0) or 0.0),
+            "dividend_cash": dividend_cash,
+            "cumulative_dividend_cash": cumulative_dividend_cash,
+            "stock_split_factor": float(row.get("stock_split_factor", 0.0) or 0.0),
+            "corporate_action_flag": bool(row.get("corporate_action_flag", False)),
+            "price_basis": str(row.get("price_basis", "raw_ohlc_split_basis_unknown")),
         }
 
     def _finalize_equity(self, equity: pd.DataFrame) -> pd.DataFrame:

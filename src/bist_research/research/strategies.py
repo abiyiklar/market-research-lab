@@ -365,32 +365,163 @@ def deterministic_signal_filter(
     return keep
 
 
-def strategy_is_causal(strategy: ResearchStrategy, frame: pd.DataFrame) -> bool:
-    if len(frame) < 3:
-        return True
+def _mutate_future(frame: pd.DataFrame, cutoff: int) -> pd.DataFrame:
     changed = frame.copy()
-    last = changed.index[-1]
+    future = changed.index[cutoff + 1 :]
+    price_columns = [
+        column
+        for column in (
+            "tuprs_open",
+            "tuprs_high",
+            "tuprs_low",
+            "tuprs_close",
+            "tuprs_adj_close",
+        )
+        if column in changed
+    ]
+    if price_columns:
+        changed.loc[future, price_columns] = changed.loc[future, price_columns] * 1.73
     for column in (
-        "tuprs_close",
+        "tuprs_volume",
+        "xu100_open",
+        "xu100_high",
+        "xu100_low",
         "xu100_close",
-        "relative_strength_xu100",
-        "relative_strength_xusin",
+        "xu100_adj_close",
+        "xusin_open",
+        "xusin_high",
+        "xusin_low",
+        "xusin_close",
+        "xusin_adj_close",
+        "usdtry_open",
+        "usdtry_high",
+        "usdtry_low",
+        "usdtry_close",
+        "usdtry_adj_close",
+        "brent_open",
+        "brent_high",
+        "brent_low",
+        "brent_close",
+        "brent_adj_close",
+        "wti_open",
+        "wti_high",
+        "wti_low",
+        "wti_close",
+        "wti_adj_close",
     ):
         if column in changed:
-            changed.loc[last, column] = float(changed.loc[last, column]) * 10
-    original_prepared = strategy.prepare(frame)
-    changed_prepared = strategy.prepare(changed)
-    research_columns = [
-        column for column in original_prepared if column.startswith("research_")
-    ]
-    for column in research_columns:
-        if not np.allclose(
-            original_prepared[column].iloc[:-1].to_numpy(dtype="float64"),
-            changed_prepared[column].iloc[:-1].to_numpy(dtype="float64"),
-            equal_nan=True,
-        ):
+            changed[column] = pd.to_numeric(changed[column], errors="coerce").astype(float)
+            changed.loc[future, column] = changed.loc[future, column] * 2.31
+    if "dividend_per_share" in changed:
+        changed.loc[future, "dividend_per_share"] = (
+            changed.loc[future, "dividend_per_share"].astype(float) + 7.0
+        )
+    if "stock_split_factor" in changed:
+        changed.loc[future, "stock_split_factor"] = 3.0
+    if "corporate_action_flag" in changed:
+        changed.loc[future, "corporate_action_flag"] = True
+    return changed
+
+
+def strong_causality_audit(
+    strategy: ResearchStrategy,
+    frame: pd.DataFrame,
+    *,
+    random_seed: int = 20240801,
+    cutpoint_count: int = 3,
+) -> bool:
+    if len(frame) < 3:
+        return True
+    rng = np.random.default_rng(random_seed)
+    first_active = 1
+    if "is_indicator_warmup" in frame:
+        active_indices = np.flatnonzero(~frame["is_indicator_warmup"].astype(bool).to_numpy())
+        if len(active_indices):
+            first_active = int(active_indices[0]) + 1
+    candidates = np.arange(max(1, len(frame) // 5, first_active), len(frame) - 1)
+    if not len(candidates):
+        return True
+    count = min(cutpoint_count, len(candidates))
+    cutpoints = sorted(int(value) for value in rng.choice(candidates, count, replace=False))
+    full_engine_audit = {
+        "date",
+        "tuprs_open",
+        "tuprs_high",
+        "tuprs_low",
+        "tuprs_close",
+        "tuprs_volume",
+        "is_indicator_warmup",
+    }.issubset(frame.columns)
+
+    for cutoff in cutpoints:
+        audit_start = max(0, cutoff - 260)
+        audit_end = min(len(frame), cutoff + 81)
+        audit_frame = frame.iloc[audit_start:audit_end].reset_index(drop=True)
+        local_cutoff = cutoff - audit_start
+        changed = _mutate_future(audit_frame, local_cutoff)
+        original_prepared = strategy.prepare(audit_frame)
+        changed_prepared = strategy.prepare(changed)
+        try:
+            pd.testing.assert_frame_equal(
+                original_prepared.iloc[: local_cutoff + 1].reset_index(drop=True),
+                changed_prepared.iloc[: local_cutoff + 1].reset_index(drop=True),
+                check_dtype=False,
+                check_exact=True,
+            )
+        except AssertionError:
+            return False
+        if not full_engine_audit:
+            continue
+
+        config = strategy.backtest_config(BacktestConfig())
+        for index in range(local_cutoff + 1):
+            original_row = original_prepared.iloc[index]
+            changed_row = changed_prepared.iloc[index]
+            if strategy.entry_signal(original_row, config) != strategy.entry_signal(
+                changed_row,
+                config,
+            ):
+                return False
+            holding_days = index % max(config.maximum_holding_days, 1) + 1
+            if strategy.exit_signal(
+                original_row,
+                holding_days,
+                config,
+            ) != strategy.exit_signal(changed_row, holding_days, config):
+                return False
+
+        from bist_research.backtest.engine import BacktestEngine
+
+        engine = BacktestEngine(
+            config=config,
+            entry_signal=strategy.entry_signal,
+            exit_signal=strategy.exit_signal,
+        )
+        original_result = engine.run(original_prepared)
+        changed_result = engine.run(changed_prepared)
+        cutoff_date = pd.Timestamp(original_prepared.iloc[local_cutoff]["date"])
+        original_equity = original_result.daily_equity.loc[
+            original_result.daily_equity["date"].le(cutoff_date)
+        ].reset_index(drop=True)
+        changed_equity = changed_result.daily_equity.loc[
+            changed_result.daily_equity["date"].le(cutoff_date)
+        ].reset_index(drop=True)
+        original_trades = original_result.trades.loc[
+            pd.to_datetime(original_result.trades["exit_date"]).le(cutoff_date)
+        ].reset_index(drop=True)
+        changed_trades = changed_result.trades.loc[
+            pd.to_datetime(changed_result.trades["exit_date"]).le(cutoff_date)
+        ].reset_index(drop=True)
+        try:
+            pd.testing.assert_frame_equal(original_equity, changed_equity, check_exact=True)
+            pd.testing.assert_frame_equal(original_trades, changed_trades, check_exact=True)
+        except AssertionError:
             return False
     return True
+
+
+def strategy_is_causal(strategy: ResearchStrategy, frame: pd.DataFrame) -> bool:
+    return strong_causality_audit(strategy, frame)
 
 
 def scale_parameters(

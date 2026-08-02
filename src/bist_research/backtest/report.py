@@ -20,6 +20,7 @@ from .metrics import (
     calculate_metrics,
     calculate_tuprs_adjusted_total_return,
     calculate_tuprs_buy_hold,
+    calculate_tuprs_explicit_dividend_total_return,
     calculate_xu100_buy_hold,
 )
 from .models import BacktestConfig, BacktestResult, PERIOD_DEFINITIONS, PeriodDefinition
@@ -89,13 +90,22 @@ def _run_period(
     BenchmarkResult,
     BenchmarkResult,
     BenchmarkResult,
+    BenchmarkResult,
 ]:
     result = BacktestEngine(config=config, logger=logger).run(frame)
     metrics = calculate_metrics(result.daily_equity, result.trades, config)
     tuprs_benchmark = calculate_tuprs_buy_hold(frame, config)
     adjusted_tuprs_benchmark = calculate_tuprs_adjusted_total_return(frame, config)
+    explicit_tuprs_benchmark = calculate_tuprs_explicit_dividend_total_return(frame, config)
     xu100_benchmark = calculate_xu100_buy_hold(frame, config)
-    return result, metrics, tuprs_benchmark, adjusted_tuprs_benchmark, xu100_benchmark
+    return (
+        result,
+        metrics,
+        tuprs_benchmark,
+        adjusted_tuprs_benchmark,
+        explicit_tuprs_benchmark,
+        xu100_benchmark,
+    )
 
 
 def run_backtest_pipeline(
@@ -111,11 +121,14 @@ def run_backtest_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    full_result, full_metrics, full_tuprs, full_adjusted_tuprs, full_xu100 = _run_period(
-        features,
-        active_config,
-        active_logger,
-    )
+    (
+        full_result,
+        full_metrics,
+        full_tuprs,
+        full_adjusted_tuprs,
+        full_explicit_tuprs,
+        full_xu100,
+    ) = _run_period(features, active_config, active_logger)
     period_rows: list[dict[str, object]] = []
     comparison_rows = [_comparison_row("all", "baseline_v1", full_metrics)]
     comparison_rows.append(
@@ -129,6 +142,13 @@ def run_backtest_pipeline(
         )
     )
     comparison_rows.append(
+        _comparison_row(
+            "all",
+            full_explicit_tuprs.name,
+            benchmark_metrics(full_explicit_tuprs, active_config),
+        )
+    )
+    comparison_rows.append(
         _comparison_row("all", full_xu100.name, benchmark_metrics(full_xu100, active_config))
     )
 
@@ -136,13 +156,23 @@ def run_backtest_pipeline(
         period_frame = slice_period(features, period)
         if period_frame.empty:
             raise ValueError(f"No data available for the {period.name} period")
-        _, metrics, tuprs_benchmark, adjusted_tuprs_benchmark, xu100_benchmark = _run_period(
-            period_frame,
-            active_config,
-            active_logger,
-        )
+        (
+            _,
+            metrics,
+            tuprs_benchmark,
+            adjusted_tuprs_benchmark,
+            explicit_tuprs_benchmark,
+            xu100_benchmark,
+        ) = _run_period(period_frame, active_config, active_logger)
         period_rows.append({"period": period.name, **metrics})
         comparison_rows.append(_comparison_row(period.name, "baseline_v1", metrics))
+        comparison_rows.append(
+            _comparison_row(
+                period.name,
+                explicit_tuprs_benchmark.name,
+                benchmark_metrics(explicit_tuprs_benchmark, active_config),
+            )
+        )
         comparison_rows.append(
             _comparison_row(
                 period.name,
@@ -173,6 +203,17 @@ def run_backtest_pipeline(
     data_quality["raw_strategy_prices_consistent"] = raw_strategy_prices_are_consistent(
         features.loc[~features["is_indicator_warmup"].astype(bool)]
     )
+    explicit_return = float(
+        benchmark_metrics(full_explicit_tuprs, active_config)["total_return"]
+    )
+    adjusted_return = float(
+        benchmark_metrics(full_adjusted_tuprs, active_config)["total_return"]
+    )
+    data_quality["explicit_adjusted_reconciliation_error"] = (
+        explicit_return - adjusted_return
+    )
+    data_quality["explicit_dividend_return"] = explicit_return
+    data_quality["adjusted_close_total_return"] = adjusted_return
 
     artifacts = BacktestArtifacts(
         trades=output_dir / "baseline_v1_trades.csv",
