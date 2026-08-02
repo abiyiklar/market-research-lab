@@ -11,6 +11,8 @@ File or Folder | Purpose
 `data/raw/` | yfinance raw downloads, ignored by git
 `data/processed/` | cleaned datasets and reports, ignored by git
 `data/features/` | generated analysis datasets and quality summaries, ignored by git
+`data/backtest/` | generated backtest tables, ignored by git
+`reports/` | generated backtest reports and charts, ignored by git
 `logs/` | collector logs, ignored by git
 
 ## Setup
@@ -71,6 +73,33 @@ Outputs:
 - `data/features/tuprs_feature_summary.csv`
 
 Relative momentum is calculated from the TUPRS/XU100 relative-strength ratio. Rolling volatility is annualized using 252 trading days.
+
+## Run Baseline V1 Backtest
+
+Run the long-only daily reference strategy from the generated TUPRS feature dataset:
+
+```powershell
+python -m bist_research.backtest.cli
+```
+
+The engine calculates signals from daily closes and executes entries at the next eligible open. It excludes indicator warm-up rows, blocks new entries on zero-volume days, uses whole shares without leverage, and applies configurable commission and slippage costs.
+
+Baseline V1 keeps its parameters fixed: the XU100 daily-return floor is `-3%`, the entry RSI range is `50-72`, the minimum volume ratio is `1.10`, the initial ATR stop is `2.5x`, the trailing ATR stop is `3.0x`, and the maximum holding period is 60 trading days. Close-based exits are evaluated at the close; intraday stops use levels known before that day's low is tested.
+
+Results are reported independently for train (`2013-2019`), validation (`2020-2022`), and test (`2023-latest`) periods, plus the full history. No parameter optimization or machine learning is performed.
+
+Optional example:
+
+```powershell
+python -m bist_research.backtest.cli `
+  --input data/features/tuprs_features.parquet `
+  --output-dir data/backtest `
+  --initial-capital 100000 `
+  --commission-rate 0.001 `
+  --slippage-rate 0.0005
+```
+
+The command writes trade, daily-equity, metric, period, benchmark, and drawdown tables to `data/backtest/`. The Markdown report and equity, drawdown, annual-return, trade-return, and benchmark charts are written to `reports/`.
 
 ## Tests
 

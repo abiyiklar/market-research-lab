@@ -1,4 +1,6 @@
 -e .
+matplotlib>=3.9
+numpy>=2.0
 pandas>=2.2
 yfinance>=0.2.54
 pyarrow>=17.0
