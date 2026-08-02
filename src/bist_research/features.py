@@ -8,9 +8,10 @@ from typing import Mapping, Sequence
 import numpy as np
 import pandas as pd
 
-from .collector import panel_configs, safe_symbol_name
 from .config import INITIAL_BIST_PANEL, SymbolConfig
 from .data_quality import OHLC_COLUMNS, tradable_session_mask
+from .symbols import panel_configs, safe_symbol_name
+from .trading_calendar import only_tradable_tuprs_sessions
 
 
 MARKET_FILES: Mapping[str, str] = {
@@ -25,10 +26,15 @@ MARKET_FILES: Mapping[str, str] = {
 
 MARKET_VALUE_COLUMNS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
 EXTERNAL_MARKETS = tuple(market for market in MARKET_FILES if market != "tuprs")
+CORPORATE_ACTION_FILE = Path("corporate_actions/TUPRS.IS_actions.parquet")
 WARMUP_DAYS = 200
 TRADING_DAYS_PER_YEAR = 252
 
 FEATURE_COLUMNS = (
+    "tuprs_signal_open",
+    "tuprs_signal_high",
+    "tuprs_signal_low",
+    "tuprs_signal_close",
     "tuprs_return_1d",
     "xu100_return_1d",
     "xusin_return_1d",
@@ -50,6 +56,14 @@ FEATURE_COLUMNS = (
     "rsi_14",
     "atr_14",
 )
+
+SIGNAL_PRICE_COLUMNS = (
+    "tuprs_signal_open",
+    "tuprs_signal_high",
+    "tuprs_signal_low",
+    "tuprs_signal_close",
+)
+PRICE_BASIS_UNADJUSTED = "raw_ohlc_unadjusted"
 
 
 @dataclass(frozen=True)
@@ -104,7 +118,7 @@ def _load_market_frame(processed_dir: Path, market: str) -> pd.DataFrame:
     frame = pd.read_parquet(path)
     required_columns = {"Date", "Close"}
     if market == "tuprs":
-        required_columns.update({"High", "Low", "Volume"})
+        required_columns.update({"Open", "High", "Low", "Volume"})
 
     missing_columns = required_columns.difference(frame.columns)
     if missing_columns:
@@ -132,11 +146,59 @@ def _prefix_market_columns(frame: pd.DataFrame, market: str) -> pd.DataFrame:
     return frame[selected_columns].rename(columns=rename_map)
 
 
+def _load_corporate_actions(processed_dir: Path) -> pd.DataFrame:
+    path = processed_dir / CORPORATE_ACTION_FILE
+    columns = [
+        "date",
+        "dividend_per_share",
+        "stock_split_factor",
+        "repaired_data",
+        "corporate_action_flag",
+        "price_basis",
+    ]
+    if not path.exists():
+        return pd.DataFrame(columns=columns)
+
+    actions = pd.read_parquet(path).copy()
+    if "Date" not in actions:
+        raise ValueError(f"{path.name} is missing required column: Date")
+    actions["date"] = pd.to_datetime(actions["Date"], errors="raise").dt.normalize()
+    dividends = pd.to_numeric(
+        actions.get("Dividends", pd.Series(0.0, index=actions.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    splits = pd.to_numeric(
+        actions.get("Stock Splits", pd.Series(0.0, index=actions.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    repaired = actions.get(
+        "Repaired",
+        actions.get("Repaired?", pd.Series(False, index=actions.index)),
+    ).fillna(False)
+    price_basis = actions.get(
+        "price_basis",
+        pd.Series("raw_ohlc_split_basis_unknown", index=actions.index),
+    )
+    prepared = pd.DataFrame(
+        {
+            "date": actions["date"],
+            "dividend_per_share": dividends,
+            "stock_split_factor": splits,
+            "repaired_data": repaired.astype(bool),
+            "corporate_action_flag": dividends.ne(0) | splits.ne(0),
+            "price_basis": price_basis.astype(str),
+        }
+    )
+    if prepared["date"].duplicated().any():
+        raise ValueError(f"{path.name} contains duplicate dates")
+    return prepared.sort_values("date").reset_index(drop=True)
+
+
 def merge_processed_markets(
     processed_dir: Path = Path("data/processed"),
 ) -> tuple[pd.DataFrame, dict[str, dict[str, int]]]:
     tuprs = _prefix_market_columns(_load_market_frame(processed_dir, "tuprs"), "tuprs")
-    merged = tuprs.sort_values("date").reset_index(drop=True)
+    merged = only_tradable_tuprs_sessions(tuprs)
     fill_stats: dict[str, dict[str, int]] = {}
 
     for market in EXTERNAL_MARKETS:
@@ -158,11 +220,69 @@ def merge_processed_markets(
             "missing_close_after_fill": int(merged[close_column].isna().sum()),
         }
 
+    actions = _load_corporate_actions(processed_dir)
+    merged = merged.merge(actions, on="date", how="left", sort=False, validate="one_to_one")
+    merged["dividend_per_share"] = merged["dividend_per_share"].fillna(0.0)
+    merged["stock_split_factor"] = merged["stock_split_factor"].fillna(0.0)
+    merged["repaired_data"] = merged["repaired_data"].fillna(False).astype(bool)
+    merged["corporate_action_flag"] = (
+        merged["corporate_action_flag"].fillna(False).astype(bool)
+    )
+    observed_basis = actions["price_basis"].dropna()
+    default_basis = (
+        str(observed_basis.iloc[0])
+        if not observed_basis.empty
+        else "raw_ohlc_split_basis_unknown"
+    )
+    merged["price_basis"] = merged["price_basis"].fillna(default_basis)
+
     return merged, fill_stats
 
 
 def _daily_return(series: pd.Series) -> pd.Series:
     return series.pct_change(fill_method=None)
+
+
+def add_tuprs_signal_prices(market_data: pd.DataFrame) -> pd.DataFrame:
+    """Build a causal, split-consistent total-return signal OHLC series."""
+    frame = market_data.copy()
+    raw_columns = ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"]
+    missing = sorted(set(raw_columns).difference(frame.columns))
+    if missing:
+        raise ValueError(f"Signal-price input is missing columns: {', '.join(missing)}")
+    if frame.empty:
+        for column in SIGNAL_PRICE_COLUMNS:
+            frame[column] = pd.Series(dtype="float64")
+        return frame
+
+    raw = frame.loc[:, raw_columns].apply(pd.to_numeric, errors="coerce")
+    dividends = pd.to_numeric(
+        frame.get("dividend_per_share", pd.Series(0.0, index=frame.index)),
+        errors="coerce",
+    ).fillna(0.0).clip(lower=0.0)
+    splits = pd.to_numeric(
+        frame.get("stock_split_factor", pd.Series(0.0, index=frame.index)),
+        errors="coerce",
+    ).fillna(0.0)
+    price_basis = frame.get(
+        "price_basis",
+        pd.Series("raw_ohlc_split_basis_unknown", index=frame.index),
+    ).astype(str)
+    split_multiplier = pd.Series(1.0, index=frame.index)
+    unadjusted_split = price_basis.eq(PRICE_BASIS_UNADJUSTED) & splits.gt(0.0)
+    split_multiplier.loc[unadjusted_split] = splits.loc[unadjusted_split]
+
+    previous_raw_close = raw["tuprs_close"].shift(1)
+    total_return_factor = (
+        (raw["tuprs_close"] + dividends) * split_multiplier
+    ) / previous_raw_close
+    total_return_factor.iloc[0] = 1.0
+    signal_close = raw["tuprs_close"].iloc[0] * total_return_factor.cumprod()
+    current_scale = signal_close / raw["tuprs_close"]
+
+    for raw_column, signal_column in zip(raw_columns, SIGNAL_PRICE_COLUMNS, strict=True):
+        frame[signal_column] = raw[raw_column] * current_scale
+    return frame
 
 
 def _relative_momentum(relative_strength: pd.Series, periods: int) -> pd.Series:
@@ -182,12 +302,12 @@ def _rsi(close: pd.Series, periods: int = 14) -> pd.Series:
 
 
 def _atr(frame: pd.DataFrame, periods: int = 14) -> pd.Series:
-    previous_close = frame["tuprs_close"].shift(1)
+    previous_close = frame["tuprs_signal_close"].shift(1)
     true_range = pd.concat(
         [
-            frame["tuprs_high"] - frame["tuprs_low"],
-            (frame["tuprs_high"] - previous_close).abs(),
-            (frame["tuprs_low"] - previous_close).abs(),
+            frame["tuprs_signal_high"] - frame["tuprs_signal_low"],
+            (frame["tuprs_signal_high"] - previous_close).abs(),
+            (frame["tuprs_signal_low"] - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
@@ -195,16 +315,27 @@ def _atr(frame: pd.DataFrame, periods: int = 14) -> pd.Series:
 
 
 def add_features(market_data: pd.DataFrame) -> pd.DataFrame:
-    frame = market_data.sort_values("date").reset_index(drop=True).copy()
+    frame = only_tradable_tuprs_sessions(market_data)
+    for column, default in (
+        ("dividend_per_share", 0.0),
+        ("stock_split_factor", 0.0),
+        ("repaired_data", False),
+        ("corporate_action_flag", False),
+        ("price_basis", "raw_ohlc_split_basis_unknown"),
+    ):
+        if column not in frame:
+            frame[column] = default
 
-    frame["tuprs_return_1d"] = _daily_return(frame["tuprs_close"])
+    frame = add_tuprs_signal_prices(frame)
+
+    frame["tuprs_return_1d"] = _daily_return(frame["tuprs_signal_close"])
     frame["xu100_return_1d"] = _daily_return(frame["xu100_close"])
     frame["xusin_return_1d"] = _daily_return(frame["xusin_close"])
     frame["brent_return_1d"] = _daily_return(frame["brent_close"])
     frame["usdtry_return_1d"] = _daily_return(frame["usdtry_close"])
 
-    frame["relative_strength_xu100"] = frame["tuprs_close"] / frame["xu100_close"]
-    frame["relative_strength_xusin"] = frame["tuprs_close"] / frame["xusin_close"]
+    frame["relative_strength_xu100"] = frame["tuprs_signal_close"] / frame["xu100_close"]
+    frame["relative_strength_xusin"] = frame["tuprs_signal_close"] / frame["xusin_close"]
     for periods in (20, 60, 120):
         frame[f"relative_momentum_{periods}d"] = _relative_momentum(
             frame["relative_strength_xu100"], periods
@@ -220,13 +351,13 @@ def add_features(market_data: pd.DataFrame) -> pd.DataFrame:
     frame["volume_ratio_20d"] = frame["tuprs_volume"] / frame["volume_average_20d"].replace(0, float("nan"))
 
     for periods in (20, 50, 100, 200):
-        frame[f"ema_{periods}"] = frame["tuprs_close"].ewm(
+        frame[f"ema_{periods}"] = frame["tuprs_signal_close"].ewm(
             span=periods,
             adjust=False,
             min_periods=periods,
         ).mean()
 
-    frame["rsi_14"] = _rsi(frame["tuprs_close"])
+    frame["rsi_14"] = _rsi(frame["tuprs_signal_close"])
     frame["atr_14"] = _atr(frame)
     frame["is_indicator_warmup"] = pd.Series(range(len(frame)), index=frame.index).lt(WARMUP_DAYS)
     return frame
@@ -249,6 +380,16 @@ def build_quality_summary(
             "category": "dataset",
             "metric": "indicator_warmup_rows",
             "value": int(features["is_indicator_warmup"].sum()),
+        },
+        {
+            "category": "dataset",
+            "metric": "corporate_action_rows",
+            "value": int(features["corporate_action_flag"].sum()),
+        },
+        {
+            "category": "dataset",
+            "metric": "repaired_rows",
+            "value": int(features["repaired_data"].sum()),
         },
     ]
 

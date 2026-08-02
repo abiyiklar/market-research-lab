@@ -6,6 +6,7 @@ import pytest
 from bist_research.backtest.metrics import (
     calculate_drawdowns,
     calculate_tuprs_buy_hold,
+    calculate_tuprs_adjusted_total_return,
     calculate_xu100_buy_hold,
 )
 from bist_research.backtest.models import BacktestConfig, PERIOD_DEFINITIONS
@@ -42,6 +43,7 @@ def test_tuprs_and_xu100_benchmarks() -> None:
             "date": pd.date_range("2024-01-02", periods=3, freq="B"),
             "tuprs_open": [100.0, 105.0, 110.0],
             "tuprs_close": [100.0, 105.0, 110.0],
+            "tuprs_adj_close": [50.0, 55.0, 60.0],
             "tuprs_volume": [1_000.0, 1_000.0, 1_000.0],
             "xu100_close": [200.0, 210.0, 220.0],
             "is_indicator_warmup": [False, False, False],
@@ -50,12 +52,16 @@ def test_tuprs_and_xu100_benchmarks() -> None:
     config = BacktestConfig(initial_capital=1_000, commission_rate=0, slippage_rate=0)
 
     tuprs = calculate_tuprs_buy_hold(frame, config)
+    adjusted_tuprs = calculate_tuprs_adjusted_total_return(frame, config)
     xu100 = calculate_xu100_buy_hold(frame, config)
 
     assert tuprs.daily_equity["total_equity"].iloc[-1] == pytest.approx(1_100.0)
+    assert adjusted_tuprs.daily_equity["total_equity"].iloc[-1] == pytest.approx(1_200.0)
     assert xu100.daily_equity["total_equity"].iloc[-1] == pytest.approx(1_100.0)
     assert tuprs.total_commission == 0
     assert xu100.total_slippage == 0
+    assert tuprs.name == "tuprs_raw_buy_hold"
+    assert adjusted_tuprs.name == "tuprs_adjusted_total_return"
 
 
 def test_train_validation_and_test_periods_do_not_overlap() -> None:

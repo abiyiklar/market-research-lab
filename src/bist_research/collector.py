@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,17 +9,17 @@ from typing import Callable, Iterable, Sequence
 
 import pandas as pd
 
+from .backtest.corporate_actions import audit_corporate_actions, detect_price_basis
 from .config import (
     BENCHMARK_SYMBOLS,
     DEFAULT_SYMBOLS,
     EQUITY_ASSET_TYPES,
     INITIAL_BIST_PANEL,
-    INITIAL_BIST_SYMBOLS,
     START_DATE,
     SymbolConfig,
-    universe_symbols,
 )
 from .data_quality import MINIMUM_FEATURE_HISTORY, collection_quality_record
+from .symbols import panel_configs, safe_symbol_name
 
 Downloader = Callable[..., pd.DataFrame]
 PRICE_COLUMNS = ("Open", "High", "Low", "Close", "Adj Close", "Volume")
@@ -55,11 +54,6 @@ class CollectionResult:
 
 class DownloadError(RuntimeError):
     """Raised when a symbol cannot be downloaded after retries."""
-
-
-def safe_symbol_name(symbol: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", symbol).strip("_")
-    return cleaned or "symbol"
 
 
 def configure_logging(log_dir: Path = Path("logs")) -> logging.Logger:
@@ -233,13 +227,77 @@ def find_zero_volume_records(config: SymbolConfig, frame: pd.DataFrame) -> pd.Da
     return zero_volume[available_columns].reset_index(drop=True)
 
 
-def save_frame(frame: pd.DataFrame, output_dir: Path, stem: str) -> SavedPaths:
+def save_frame(
+    frame: pd.DataFrame,
+    output_dir: Path,
+    stem: str,
+    *,
+    overwrite: bool = True,
+) -> SavedPaths:
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = output_dir / f"{stem}.csv"
     parquet_path = output_dir / f"{stem}.parquet"
-    frame.to_csv(csv_path, index=False)
-    frame.to_parquet(parquet_path, index=False)
+    if overwrite or not csv_path.exists():
+        frame.to_csv(csv_path, index=False)
+    if overwrite or not parquet_path.exists():
+        frame.to_parquet(parquet_path, index=False)
     return SavedPaths(csv=csv_path, parquet=parquet_path)
+
+
+def collect_corporate_action_history(
+    config: SymbolConfig,
+    output_dir: Path = Path("data/processed/corporate_actions"),
+    start_date: str = START_DATE,
+    downloader: Downloader | None = None,
+    retries: int = 3,
+    backoff_seconds: float = 2.0,
+    logger: logging.Logger | None = None,
+) -> tuple[SavedPaths, SavedPaths, pd.DataFrame]:
+    """Save action-enriched history and an explicit audit outside raw storage."""
+    active_logger = logger or logging.getLogger("bist_research.collector")
+    history = download_symbol(
+        config.symbol,
+        start_date=start_date,
+        downloader=downloader,
+        retries=retries,
+        backoff_seconds=backoff_seconds,
+        logger=active_logger,
+    )
+    for column, default in (
+        ("Dividends", 0.0),
+        ("Stock Splits", 0.0),
+        ("Repaired", False),
+    ):
+        if column not in history:
+            history[column] = default
+    history["price_basis"] = detect_price_basis(history)
+
+    stem = f"{safe_symbol_name(config.symbol)}_actions"
+    history_paths = save_frame(history, output_dir, stem)
+    feature_like = history.rename(
+        columns={
+            "Date": "date",
+            "Open": "tuprs_open",
+            "Close": "tuprs_close",
+            "Adj Close": "tuprs_adj_close",
+            "Dividends": "dividend_per_share",
+            "Stock Splits": "stock_split_factor",
+            "Repaired": "repaired_data",
+        }
+    )
+    feature_like["corporate_action_flag"] = (
+        feature_like["dividend_per_share"].fillna(0).ne(0)
+        | feature_like["stock_split_factor"].fillna(0).ne(0)
+    )
+    audit = audit_corporate_actions(feature_like)
+    audit_paths = save_frame(audit, output_dir, f"{stem}_audit")
+    active_logger.info(
+        "Saved %s corporate-action rows for %s (%s)",
+        int(feature_like["corporate_action_flag"].sum()),
+        config.symbol,
+        history["price_basis"].iloc[0],
+    )
+    return history_paths, audit_paths, audit
 
 
 def collect_symbol(
@@ -251,6 +309,7 @@ def collect_symbol(
     retries: int = 3,
     backoff_seconds: float = 2.0,
     logger: logging.Logger | None = None,
+    overwrite_raw: bool = False,
 ) -> tuple[CollectionResult, pd.DataFrame]:
     active_logger = logger or logging.getLogger("bist_research.collector")
     active_logger.info("Collecting %s from %s", config.symbol, start_date)
@@ -265,7 +324,8 @@ def collect_symbol(
     cleaned = clean_price_data(raw)
     zero_volume = find_zero_volume_records(config, cleaned)
     safe_name = safe_symbol_name(config.symbol)
-    save_frame(raw, raw_dir, safe_name)
+
+    save_frame(raw, raw_dir, safe_name, overwrite=overwrite_raw)
     save_frame(cleaned, processed_dir, safe_name)
     return (
         CollectionResult(
@@ -290,6 +350,7 @@ def collect_all(
     retries: int = 3,
     backoff_seconds: float = 2.0,
     logger: logging.Logger | None = None,
+    overwrite_raw: bool = False,
 ) -> list[CollectionResult]:
     active_logger = logger or configure_logging()
     results: list[CollectionResult] = []
@@ -305,6 +366,7 @@ def collect_all(
                 retries=retries,
                 backoff_seconds=backoff_seconds,
                 logger=active_logger,
+                overwrite_raw=overwrite_raw,
             )
             results.append(result)
             if not zero_volume.empty:
@@ -386,20 +448,6 @@ def _collect_panel_dataset(
     cleaned = clean_price_data(merged)
     save_frame(cleaned, processed_symbol_dir, "prices")
     return merged, cleaned, duplicate_count, len(downloaded)
-
-
-def _known_panel_config(symbol: str) -> SymbolConfig:
-    known = {config.symbol: config for config in INITIAL_BIST_SYMBOLS}
-    return known.get(symbol, SymbolConfig(symbol, "equity", symbol))
-
-
-def panel_configs(
-    universe: str | None = None,
-    symbols: Iterable[str] | None = None,
-) -> tuple[SymbolConfig, ...]:
-    if symbols:
-        return tuple(_known_panel_config(symbol) for symbol in symbols)
-    return universe_symbols(universe or INITIAL_BIST_PANEL)
 
 
 def collect_panel(
@@ -582,12 +630,47 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--backoff-seconds", type=float, default=2.0, help="Linear retry backoff base seconds.")
     parser.add_argument("--universe", choices=[INITIAL_BIST_PANEL], help="Configured research universe.")
     parser.add_argument("--symbols", nargs="+", help="Optional panel symbol override.")
+    parser.add_argument(
+        "--actions-only",
+        action="store_true",
+        help="Save action-enriched equity histories separately without changing raw files.",
+    )
+    parser.add_argument(
+        "--corporate-action-dir",
+        type=Path,
+        default=Path("data/processed/corporate_actions"),
+    )
+    parser.add_argument(
+        "--overwrite-raw",
+        action="store_true",
+        help="Explicitly allow replacement of existing raw CSV and Parquet files.",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     logger = configure_logging(args.log_dir)
+    if args.actions_only:
+        action_configs = configs_for_symbols(args.symbols) if args.symbols else DEFAULT_SYMBOLS
+        action_symbols = [
+            config for config in action_configs if config.asset_type in EQUITY_ASSET_TYPES
+        ]
+        try:
+            for config in action_symbols:
+                collect_corporate_action_history(
+                    config,
+                    output_dir=args.corporate_action_dir,
+                    start_date=args.start_date,
+                    retries=args.retries,
+                    backoff_seconds=args.backoff_seconds,
+                    logger=logger,
+                )
+        except Exception:
+            logger.exception("Corporate-action collection failed")
+            return 1
+        return 0
+
     if args.universe or args.symbols:
         results = collect_panel(
             symbols=panel_configs(args.universe, args.symbols),
@@ -608,6 +691,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             retries=args.retries,
             backoff_seconds=args.backoff_seconds,
             logger=logger,
+            overwrite_raw=args.overwrite_raw,
         )
     return 0 if all(result.success for result in results) else 1
 

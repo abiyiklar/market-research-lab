@@ -5,6 +5,9 @@ from dataclasses import dataclass
 
 import pandas as pd
 
+from bist_research.trading_calendar import only_tradable_tuprs_sessions
+
+from .corporate_actions import PRICE_BASIS_UNADJUSTED
 from .models import BacktestConfig
 
 
@@ -157,6 +160,11 @@ def calculate_metrics(
             else 0.0
         ),
         "total_slippage_cost": float(trades["slippage_cost"].sum()) if not trades.empty else 0.0,
+        "total_dividend_cash": (
+            float(trades["dividend_cash"].sum())
+            if not trades.empty and "dividend_cash" in trades
+            else 0.0
+        ),
         "maximum_consecutive_wins": _longest_streak(wins, True),
         "maximum_consecutive_losses": _longest_streak(losses, True),
     }
@@ -202,11 +210,65 @@ def calculate_tuprs_buy_hold(
     slippage = quantity * (effective_entry - raw_entry) + quantity * (raw_exit - effective_exit)
     equity = _benchmark_equity_curve(eligible["date"], values, config.initial_capital)
     return BenchmarkResult(
-        name="tuprs_buy_hold",
+        name="tuprs_raw_buy_hold",
         daily_equity=equity,
         total_commission=entry_commission + exit_commission,
         total_slippage=slippage,
     )
+
+
+def calculate_tuprs_adjusted_total_return(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+) -> BenchmarkResult:
+    if "tuprs_adj_close" not in frame:
+        raise ValueError("Adjusted TUPRS benchmark requires tuprs_adj_close")
+    eligible = frame.loc[
+        (~frame["is_indicator_warmup"].astype(bool))
+        & frame["tuprs_adj_close"].notna()
+        & (frame["tuprs_adj_close"] > 0)
+    ].reset_index(drop=True)
+    if eligible.empty:
+        raise ValueError("No eligible rows for the adjusted TUPRS benchmark")
+
+    starting_price = float(eligible["tuprs_adj_close"].iloc[0])
+    values = (
+        config.initial_capital * eligible["tuprs_adj_close"] / starting_price
+    ).astype(float).tolist()
+    equity = _benchmark_equity_curve(eligible["date"], values, config.initial_capital)
+    return BenchmarkResult(name="tuprs_adjusted_total_return", daily_equity=equity)
+
+
+def calculate_tuprs_explicit_dividend_total_return(
+    frame: pd.DataFrame,
+    config: BacktestConfig,
+) -> BenchmarkResult:
+    """Buy and hold raw OHLC while crediting reported cash dividends explicitly."""
+    eligible = only_tradable_tuprs_sessions(frame)
+    eligible = eligible.loc[~eligible["is_indicator_warmup"].astype(bool)].reset_index(
+        drop=True
+    )
+    if eligible.empty:
+        raise ValueError("No eligible rows for the explicit-dividend TUPRS benchmark")
+    quantity = config.initial_capital / float(eligible["tuprs_close"].iloc[0])
+    cash = 0.0
+    values: list[float] = []
+    for row in eligible.itertuples(index=False):
+        split_factor = float(getattr(row, "stock_split_factor", 0.0) or 0.0)
+        price_basis = str(
+            getattr(row, "price_basis", "raw_ohlc_split_basis_unknown")
+        )
+        if split_factor > 0 and price_basis == PRICE_BASIS_UNADJUSTED:
+            quantity *= split_factor
+        dividend = float(getattr(row, "dividend_per_share", 0.0) or 0.0)
+        cash += (
+            quantity
+            * max(dividend, 0.0)
+            * (1 - config.dividend_withholding_rate)
+        )
+        values.append(cash + quantity * float(row.tuprs_close))
+    equity = _benchmark_equity_curve(eligible["date"], values, config.initial_capital)
+    return BenchmarkResult(name="tuprs_explicit_dividend_total_return", daily_equity=equity)
 
 
 def calculate_xu100_buy_hold(

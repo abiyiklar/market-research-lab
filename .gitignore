@@ -63,6 +63,7 @@ data/processed/
 data/features/
 data/quality/
 data/backtest/
+data/research/
 reports/
 local_settings.py
 db.sqlite3
