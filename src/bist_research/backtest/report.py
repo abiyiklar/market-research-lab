@@ -12,12 +12,15 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
 from .engine import BacktestEngine, load_feature_data
+from .corporate_actions import audit_corporate_actions, raw_strategy_prices_are_consistent
 from .metrics import (
     BenchmarkResult,
     benchmark_metrics,
     calculate_drawdowns,
     calculate_metrics,
+    calculate_tuprs_adjusted_total_return,
     calculate_tuprs_buy_hold,
+    calculate_tuprs_explicit_dividend_total_return,
     calculate_xu100_buy_hold,
 )
 from .models import BacktestConfig, BacktestResult, PERIOD_DEFINITIONS, PeriodDefinition
@@ -32,6 +35,7 @@ class BacktestArtifacts:
     period_metrics: Path
     benchmark: Path
     drawdowns: Path
+    data_quality: Path
     markdown_report: Path
     equity_curve: Path
     drawdown_chart: Path
@@ -80,12 +84,28 @@ def _run_period(
     frame: pd.DataFrame,
     config: BacktestConfig,
     logger: logging.Logger,
-) -> tuple[BacktestResult, dict[str, object], BenchmarkResult, BenchmarkResult]:
+) -> tuple[
+    BacktestResult,
+    dict[str, object],
+    BenchmarkResult,
+    BenchmarkResult,
+    BenchmarkResult,
+    BenchmarkResult,
+]:
     result = BacktestEngine(config=config, logger=logger).run(frame)
     metrics = calculate_metrics(result.daily_equity, result.trades, config)
     tuprs_benchmark = calculate_tuprs_buy_hold(frame, config)
+    adjusted_tuprs_benchmark = calculate_tuprs_adjusted_total_return(frame, config)
+    explicit_tuprs_benchmark = calculate_tuprs_explicit_dividend_total_return(frame, config)
     xu100_benchmark = calculate_xu100_buy_hold(frame, config)
-    return result, metrics, tuprs_benchmark, xu100_benchmark
+    return (
+        result,
+        metrics,
+        tuprs_benchmark,
+        adjusted_tuprs_benchmark,
+        explicit_tuprs_benchmark,
+        xu100_benchmark,
+    )
 
 
 def run_backtest_pipeline(
@@ -101,15 +121,32 @@ def run_backtest_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
     report_dir.mkdir(parents=True, exist_ok=True)
 
-    full_result, full_metrics, full_tuprs, full_xu100 = _run_period(
-        features,
-        active_config,
-        active_logger,
-    )
+    (
+        full_result,
+        full_metrics,
+        full_tuprs,
+        full_adjusted_tuprs,
+        full_explicit_tuprs,
+        full_xu100,
+    ) = _run_period(features, active_config, active_logger)
     period_rows: list[dict[str, object]] = []
     comparison_rows = [_comparison_row("all", "baseline_v1", full_metrics)]
     comparison_rows.append(
         _comparison_row("all", full_tuprs.name, benchmark_metrics(full_tuprs, active_config))
+    )
+    comparison_rows.append(
+        _comparison_row(
+            "all",
+            full_adjusted_tuprs.name,
+            benchmark_metrics(full_adjusted_tuprs, active_config),
+        )
+    )
+    comparison_rows.append(
+        _comparison_row(
+            "all",
+            full_explicit_tuprs.name,
+            benchmark_metrics(full_explicit_tuprs, active_config),
+        )
     )
     comparison_rows.append(
         _comparison_row("all", full_xu100.name, benchmark_metrics(full_xu100, active_config))
@@ -119,18 +156,35 @@ def run_backtest_pipeline(
         period_frame = slice_period(features, period)
         if period_frame.empty:
             raise ValueError(f"No data available for the {period.name} period")
-        _, metrics, tuprs_benchmark, xu100_benchmark = _run_period(
-            period_frame,
-            active_config,
-            active_logger,
-        )
+        (
+            _,
+            metrics,
+            tuprs_benchmark,
+            adjusted_tuprs_benchmark,
+            explicit_tuprs_benchmark,
+            xu100_benchmark,
+        ) = _run_period(period_frame, active_config, active_logger)
         period_rows.append({"period": period.name, **metrics})
         comparison_rows.append(_comparison_row(period.name, "baseline_v1", metrics))
         comparison_rows.append(
             _comparison_row(
                 period.name,
+                explicit_tuprs_benchmark.name,
+                benchmark_metrics(explicit_tuprs_benchmark, active_config),
+            )
+        )
+        comparison_rows.append(
+            _comparison_row(
+                period.name,
                 tuprs_benchmark.name,
                 benchmark_metrics(tuprs_benchmark, active_config),
+            )
+        )
+        comparison_rows.append(
+            _comparison_row(
+                period.name,
+                adjusted_tuprs_benchmark.name,
+                benchmark_metrics(adjusted_tuprs_benchmark, active_config),
             )
         )
         comparison_rows.append(
@@ -145,6 +199,21 @@ def run_backtest_pipeline(
     period_table = pd.DataFrame(period_rows)
     benchmark_table = pd.DataFrame(comparison_rows)
     drawdown_table = calculate_drawdowns(full_result.daily_equity)
+    data_quality = audit_corporate_actions(features)
+    data_quality["raw_strategy_prices_consistent"] = raw_strategy_prices_are_consistent(
+        features.loc[~features["is_indicator_warmup"].astype(bool)]
+    )
+    explicit_return = float(
+        benchmark_metrics(full_explicit_tuprs, active_config)["total_return"]
+    )
+    adjusted_return = float(
+        benchmark_metrics(full_adjusted_tuprs, active_config)["total_return"]
+    )
+    data_quality["explicit_adjusted_reconciliation_error"] = (
+        explicit_return - adjusted_return
+    )
+    data_quality["explicit_dividend_return"] = explicit_return
+    data_quality["adjusted_close_total_return"] = adjusted_return
 
     artifacts = BacktestArtifacts(
         trades=output_dir / "baseline_v1_trades.csv",
@@ -153,6 +222,7 @@ def run_backtest_pipeline(
         period_metrics=output_dir / "baseline_v1_period_metrics.csv",
         benchmark=output_dir / "baseline_v1_benchmark.csv",
         drawdowns=output_dir / "baseline_v1_drawdowns.csv",
+        data_quality=output_dir / "baseline_v1_data_quality.csv",
         markdown_report=report_dir / "baseline_v1_report.md",
         equity_curve=report_dir / "baseline_v1_equity_curve.png",
         drawdown_chart=report_dir / "baseline_v1_drawdown.png",
@@ -167,8 +237,15 @@ def run_backtest_pipeline(
     period_table.to_csv(artifacts.period_metrics, index=False)
     benchmark_table.to_csv(artifacts.benchmark, index=False)
     drawdown_table.to_csv(artifacts.drawdowns, index=False)
+    data_quality.to_csv(artifacts.data_quality, index=False)
 
-    _write_markdown_report(artifacts.markdown_report, full_metrics, period_table, benchmark_table)
+    _write_markdown_report(
+        artifacts.markdown_report,
+        full_metrics,
+        period_table,
+        benchmark_table,
+        data_quality,
+    )
     _plot_equity_curve(full_result.daily_equity, artifacts.equity_curve)
     _plot_drawdown(drawdown_table, artifacts.drawdown_chart)
     _plot_annual_returns(full_result.daily_equity, artifacts.annual_returns)
@@ -176,6 +253,7 @@ def run_backtest_pipeline(
     _plot_strategy_vs_benchmarks(
         full_result.daily_equity,
         full_tuprs,
+        full_adjusted_tuprs,
         full_xu100,
         artifacts.strategy_vs_benchmark,
     )
@@ -197,6 +275,7 @@ def _write_markdown_report(
     metrics: dict[str, object],
     period_table: pd.DataFrame,
     benchmark_table: pd.DataFrame,
+    data_quality: pd.DataFrame,
 ) -> None:
     comparison = benchmark_table.loc[
         benchmark_table["period"].eq("all"),
@@ -210,6 +289,7 @@ def _write_markdown_report(
         "## Methodology",
         "",
         "Signals are calculated from daily closes and entries execute at the next eligible open. "
+        "Close-based exits also execute at the following trading day's open. "
         "The engine is long-only, unleveraged, uses whole shares, and carries one position at a time. "
         "Stops use only levels known before the intraday low is evaluated.",
         "",
@@ -256,9 +336,19 @@ def _write_markdown_report(
             "",
             "- Indicator warm-up rows are excluded.",
             "- Entry signals execute on the following trading day's open.",
+            "- Close-based exit signals execute on the following trading day's open.",
             "- External market values are inherited from the causal feature pipeline only.",
             "- No parameter optimization or machine learning is used.",
             "- The fixed TUPRS symbol avoids index-constituent selection during this baseline stage.",
+            "",
+            "## Corporate Actions",
+            "",
+            f"- Corporate-action candidates: {int(data_quality['corporate_action_candidate'].sum())}.",
+            f"- Raw OHLC consistency check: {bool(data_quality['raw_strategy_prices_consistent'].all())}.",
+            "- Indicators and signals use causal total-return-continuous TUPRS signal OHLC; actual fills remain on unchanged raw OHLC.",
+            "- Raw-basis stop and trailing references are reduced by the reported dividend before ex-date raw-price comparisons.",
+            "- `tuprs_raw_buy_hold` uses tradable raw prices and execution costs.",
+            "- `tuprs_adjusted_total_return` uses Adjusted Close as a return index, so Yahoo's dividend and split adjustments are reflected; it does not apply explicit transaction costs.",
             "",
         ]
     )
@@ -317,6 +407,7 @@ def _plot_trade_returns(trades: pd.DataFrame, path: Path) -> None:
 def _plot_strategy_vs_benchmarks(
     strategy: pd.DataFrame,
     tuprs: BenchmarkResult,
+    adjusted_tuprs: BenchmarkResult,
     xu100: BenchmarkResult,
     path: Path,
 ) -> None:
@@ -326,6 +417,11 @@ def _plot_strategy_vs_benchmarks(
         tuprs.daily_equity["date"],
         tuprs.daily_equity["cumulative_return"] * 100,
         label="TUPRS Buy & Hold",
+    )
+    axis.plot(
+        adjusted_tuprs.daily_equity["date"],
+        adjusted_tuprs.daily_equity["cumulative_return"] * 100,
+        label="TUPRS Adjusted Total Return",
     )
     axis.plot(
         xu100.daily_equity["date"],

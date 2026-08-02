@@ -4,6 +4,7 @@ import pandas as pd
 
 from bist_research.collector import (
     clean_price_data,
+    collect_corporate_action_history,
     download_symbol,
     find_zero_volume_records,
     safe_symbol_name,
@@ -86,6 +87,64 @@ def test_download_symbol_retries_and_normalizes_response() -> None:
     assert calls == ["TUPRS.IS", "TUPRS.IS"]
     assert frame.iloc[0]["Symbol"] == "TUPRS.IS"
     assert frame.iloc[0]["Close"] == 1.1
+
+
+def test_download_requests_actions_and_repair_mode() -> None:
+    captured: dict[str, object] = {}
+
+    def downloader(**kwargs: object) -> pd.DataFrame:
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "Open": [1.0],
+                "High": [1.2],
+                "Low": [0.9],
+                "Close": [1.1],
+                "Adj Close": [1.0],
+                "Volume": [100],
+                "Dividends": [0.1],
+                "Stock Splits": [0.0],
+                "Repaired?": [False],
+            },
+            index=pd.DatetimeIndex(["2024-01-01"], name="Date"),
+        )
+
+    frame = download_symbol("TUPRS.IS", downloader=downloader)
+
+    assert captured["actions"] is True
+    assert captured["repair"] is True
+    assert {"Dividends", "Stock Splits", "Repaired?"}.issubset(frame.columns)
+
+
+def test_corporate_action_history_is_saved_in_separate_directory(tmp_path: Path) -> None:
+    def downloader(**kwargs: object) -> pd.DataFrame:
+        del kwargs
+        return pd.DataFrame(
+            {
+                "Open": [100.0, 90.0],
+                "High": [101.0, 91.0],
+                "Low": [99.0, 89.0],
+                "Close": [100.0, 90.0],
+                "Adj Close": [90.0, 90.0],
+                "Volume": [100, 100],
+                "Dividends": [0.0, 10.0],
+                "Stock Splits": [0.0, 0.0],
+                "Repaired?": [False, True],
+            },
+            index=pd.DatetimeIndex(["2024-01-01", "2024-01-02"], name="Date"),
+        )
+
+    output = tmp_path / "processed" / "corporate_actions"
+    history_paths, audit_paths, audit = collect_corporate_action_history(
+        SymbolConfig("TUPRS.IS", "equity", "Tupras"),
+        output_dir=output,
+        downloader=downloader,
+    )
+
+    assert history_paths.parquet.exists()
+    assert audit_paths.csv.exists()
+    assert int(audit["corporate_action_flag"].sum()) == 1
+    assert not (tmp_path / "raw").exists()
 
 
 def test_save_frame_writes_csv_and_parquet(tmp_path: Path, monkeypatch) -> None:

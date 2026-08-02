@@ -8,12 +8,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from bist_research.trading_calendar import only_tradable_tuprs_sessions
+from bist_research.features import (
+    SIGNAL_PRICE_COLUMNS,
+    add_features,
+    add_tuprs_signal_prices,
+)
+
+from .corporate_actions import PRICE_BASIS_UNADJUSTED
 from .models import (
     EQUITY_COLUMNS,
     TRADE_COLUMNS,
     BacktestConfig,
     BacktestResult,
     PendingEntry,
+    PendingExit,
     Position,
     Trade,
 )
@@ -21,6 +30,7 @@ from .strategy import baseline_entry_signal, close_exit_reason, prepare_strategy
 
 
 EntrySignal = Callable[[pd.Series, BacktestConfig], bool]
+ExitSignal = Callable[[pd.Series, int, BacktestConfig], str | None]
 
 REQUIRED_COLUMNS = (
     "date",
@@ -28,6 +38,7 @@ REQUIRED_COLUMNS = (
     "tuprs_high",
     "tuprs_low",
     "tuprs_close",
+    *SIGNAL_PRICE_COLUMNS,
     "tuprs_volume",
     "xu100_close",
     "xu100_return_1d",
@@ -54,22 +65,38 @@ def load_feature_data(path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Backtest input file not found: {path}")
     if path.suffix.lower() != ".parquet":
         raise ValueError("Backtest input must be a Parquet file")
-    return validate_feature_data(pd.read_parquet(path))
+    frame = pd.read_parquet(path)
+    if not set(SIGNAL_PRICE_COLUMNS).issubset(frame.columns):
+        frame = add_features(frame)
+    return validate_feature_data(frame)
 
 
 def validate_feature_data(frame: pd.DataFrame) -> pd.DataFrame:
-    missing = sorted(set(REQUIRED_COLUMNS).difference(frame.columns))
+    validated = frame.copy()
+    optional_defaults: dict[str, object] = {
+        "dividend_per_share": 0.0,
+        "stock_split_factor": 0.0,
+        "repaired_data": False,
+        "corporate_action_flag": False,
+        "price_basis": "raw_ohlc_split_basis_unknown",
+    }
+    for column, default in optional_defaults.items():
+        if column not in validated:
+            validated[column] = default
+    source_required = set(REQUIRED_COLUMNS).difference(SIGNAL_PRICE_COLUMNS)
+    missing = sorted(source_required.difference(validated.columns))
     if missing:
         raise ValueError(f"Feature dataset is missing required columns: {', '.join(missing)}")
-
-    validated = frame.copy()
     validated["date"] = pd.to_datetime(validated["date"], errors="raise").dt.normalize()
     validated = validated.sort_values("date").reset_index(drop=True)
     if validated["date"].duplicated().any():
         raise ValueError("Feature dataset contains duplicate dates")
+    validated = add_tuprs_signal_prices(validated)
     if validated["is_indicator_warmup"].isna().any():
         raise ValueError("is_indicator_warmup contains missing values")
 
+    validated = only_tradable_tuprs_sessions(validated)
+    validated["is_tradable_tuprs_session"] = True
     active = validated.loc[~validated["is_indicator_warmup"].astype(bool)]
     if active.empty:
         raise ValueError("Feature dataset has no rows outside the indicator warm-up period")
@@ -80,6 +107,10 @@ def validate_feature_data(frame: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("TUPRS price columns must be positive outside warm-up rows")
     if (active["tuprs_high"] < active["tuprs_low"]).any():
         raise ValueError("TUPRS high price cannot be below low price")
+    if (active[list(SIGNAL_PRICE_COLUMNS)] <= 0).any().any():
+        raise ValueError("TUPRS signal-price columns must be positive outside warm-up rows")
+    if (active["tuprs_signal_high"] < active["tuprs_signal_low"]).any():
+        raise ValueError("TUPRS signal high price cannot be below signal low price")
     return validated
 
 
@@ -88,10 +119,12 @@ class BacktestEngine:
         self,
         config: BacktestConfig | None = None,
         entry_signal: EntrySignal = baseline_entry_signal,
+        exit_signal: ExitSignal = close_exit_reason,
         logger: logging.Logger | None = None,
     ) -> None:
         self.config = config or BacktestConfig()
         self.entry_signal = entry_signal
+        self.exit_signal = exit_signal
         self.logger = logger or logging.getLogger("bist_research.backtest")
 
     def run(self, feature_data: pd.DataFrame) -> BacktestResult:
@@ -102,67 +135,123 @@ class BacktestEngine:
         cash = self.config.initial_capital
         position: Position | None = None
         pending_entry: PendingEntry | None = None
+        pending_exit: PendingExit | None = None
         trades: list[Trade] = []
         equity_rows: list[dict[str, object]] = []
+        cumulative_dividend_cash = 0.0
 
         for row_number, row in rows.iterrows():
             date = pd.Timestamp(row["date"])
             is_last_row = row_number == len(rows) - 1
+            dividend_cash = 0.0
+
+            if position is not None:
+                self._apply_stock_split(position, row)
+                self._apply_dividend_reference_adjustment(position, row)
+                dividend_cash = self._credit_dividend(position, row)
+                cash += dividend_cash
+                cumulative_dividend_cash += dividend_cash
 
             if position is None and pending_entry is not None:
-                position, cash = self._open_position(row, pending_entry, len(trades) + 1, cash)
-                pending_entry = None
+                if pending_entry.sessions_until_entry <= 1:
+                    position, cash = self._open_position(
+                        row, pending_entry, len(trades) + 1, cash
+                    )
+                    pending_entry = None
+                else:
+                    pending_entry = PendingEntry(
+                        signal_date=pending_entry.signal_date,
+                        atr_at_signal=pending_entry.atr_at_signal,
+                        sessions_until_entry=pending_entry.sessions_until_entry - 1,
+                    )
 
             if position is not None:
                 position.holding_days += 1
                 stop_price = position.current_stop
-                if float(row["tuprs_low"]) <= stop_price:
-                    raw_exit = min(float(row["tuprs_open"]), stop_price)
-                    stop_reason = (
-                        "trailing_stop"
-                        if stop_price > position.initial_stop + 1e-12
-                        else "atr_stop"
+                stop_reason = self._stop_reason(position)
+
+                # A gap through the known stop happens before a pending open exit.
+                if float(row["tuprs_open"]) <= stop_price:
+                    self._update_exit_excursions(position, float(row["tuprs_open"]))
+                    trade, cash = self._close_position(
+                        position,
+                        date,
+                        float(row["tuprs_open"]),
+                        stop_reason,
+                        cash,
                     )
-                    competing_reason = close_exit_reason(row, position.holding_days, self.config)
-                    if competing_reason is None and is_last_row:
-                        competing_reason = "end_of_period"
-                    if competing_reason is not None and float(row["tuprs_close"]) < raw_exit:
-                        raw_exit = float(row["tuprs_close"])
-                        reason = f"{stop_reason}+{competing_reason}"
-                    else:
-                        reason = stop_reason
-                    position.maximum_price = max(position.maximum_price, raw_exit)
-                    position.minimum_price = min(position.minimum_price, raw_exit)
-                    trade, cash = self._close_position(position, date, raw_exit, reason, cash)
+                    trades.append(trade)
+                    position = None
+                    pending_exit = None
+                elif pending_exit is not None:
+                    self._update_exit_excursions(position, float(row["tuprs_open"]))
+                    trade, cash = self._close_position(
+                        position,
+                        date,
+                        float(row["tuprs_open"]),
+                        pending_exit.reason,
+                        cash,
+                    )
+                    trades.append(trade)
+                    position = None
+                    pending_exit = None
+                elif float(row["tuprs_low"]) <= stop_price:
+                    self._update_exit_excursions(position, stop_price)
+                    trade, cash = self._close_position(
+                        position,
+                        date,
+                        stop_price,
+                        stop_reason,
+                        cash,
+                    )
                     trades.append(trade)
                     position = None
                 else:
                     self._update_excursions(position, row)
                     position.highest_close = max(position.highest_close, float(row["tuprs_close"]))
-                    reason = close_exit_reason(row, position.holding_days, self.config)
-                    if reason is None and is_last_row:
-                        reason = "end_of_period"
-                    if reason is not None:
+                    if is_last_row:
                         trade, cash = self._close_position(
                             position,
                             date,
                             float(row["tuprs_close"]),
-                            reason,
+                            "end_of_period",
                             cash,
                         )
                         trades.append(trade)
                         position = None
                     else:
+                        reason = self.exit_signal(row, position.holding_days, self.config)
+                        if reason is not None:
+                            pending_exit = PendingExit(signal_date=date, reason=reason)
                         trailing_stop = (
                             position.highest_close
-                            - self.config.atr_trailing_multiplier * float(row["atr_14"])
+                            - self.config.atr_trailing_multiplier
+                            * self._raw_basis_atr(row, float(row["atr_14"]), "close")
                         )
                         position.current_stop = max(position.initial_stop, trailing_stop)
 
-            if position is None and not is_last_row and self._can_schedule_entry(row):
-                pending_entry = PendingEntry(date, float(row["atr_14"]))
+            if (
+                position is None
+                and pending_entry is None
+                and pending_exit is None
+                and not is_last_row
+                and self._can_schedule_entry(row)
+            ):
+                pending_entry = PendingEntry(
+                    date,
+                    float(row["atr_14"]),
+                    self.config.entry_delay_days,
+                )
 
-            equity_rows.append(self._equity_row(row, cash, position))
+            equity_rows.append(
+                self._equity_row(
+                    row,
+                    cash,
+                    position,
+                    dividend_cash,
+                    cumulative_dividend_cash,
+                )
+            )
 
         trade_frame = pd.DataFrame((trade.to_dict() for trade in trades), columns=TRADE_COLUMNS)
         equity_frame = self._finalize_equity(pd.DataFrame(equity_rows))
@@ -198,7 +287,11 @@ class BacktestEngine:
 
         entry_commission = quantity * effective_price * self.config.commission_rate
         cash_after_entry = cash - quantity * effective_price - entry_commission
-        initial_stop = effective_price - self.config.atr_stop_multiplier * pending.atr_at_signal
+        initial_stop = (
+            effective_price
+            - self.config.atr_stop_multiplier
+            * self._raw_basis_atr(row, pending.atr_at_signal, "open")
+        )
         position = Position(
             trade_id=trade_id,
             signal_date=pending.signal_date,
@@ -212,6 +305,7 @@ class BacktestEngine:
             highest_close=raw_price,
             maximum_price=raw_price,
             minimum_price=raw_price,
+            price_basis=str(row.get("price_basis", "raw_ohlc_split_basis_unknown")),
         )
         self.logger.debug(
             "Opened trade %s on %s at %.4f for %s shares",
@@ -239,11 +333,15 @@ class BacktestEngine:
         )
         exit_slippage = position.quantity * (raw_price - effective_price)
         slippage_cost = entry_slippage + exit_slippage
-        gross_pnl = position.quantity * (raw_price - position.entry_price_raw)
+        gross_pnl = (
+            position.quantity * (raw_price - position.entry_price_raw)
+            + position.cumulative_dividend_cash
+        )
         net_pnl = (
             position.quantity * (effective_price - position.entry_price_effective)
             - position.entry_commission
             - exit_commission
+            + position.cumulative_dividend_cash
         )
         invested_capital = (
             position.quantity * position.entry_price_effective + position.entry_commission
@@ -267,6 +365,11 @@ class BacktestEngine:
             exit_reason=reason,
             exit_commission=exit_commission,
             slippage_cost=slippage_cost,
+            dividend_cash=position.cumulative_dividend_cash,
+            cumulative_dividend_cash=position.cumulative_dividend_cash,
+            stock_split_factor=position.cumulative_stock_split_factor,
+            corporate_action_flag=position.corporate_action_flag,
+            price_basis=position.price_basis,
             gross_pnl=gross_pnl,
             net_pnl=net_pnl,
             return_pct=trade_return,
@@ -289,10 +392,75 @@ class BacktestEngine:
         position.minimum_price = min(position.minimum_price, float(row["tuprs_low"]))
 
     @staticmethod
+    def _update_exit_excursions(position: Position, exit_price: float) -> None:
+        position.maximum_price = max(position.maximum_price, exit_price)
+        position.minimum_price = min(position.minimum_price, exit_price)
+
+    @staticmethod
+    def _stop_reason(position: Position) -> str:
+        return (
+            "trailing_stop"
+            if position.current_stop > position.initial_stop + 1e-12
+            else "atr_stop"
+        )
+
+    def _credit_dividend(self, position: Position, row: pd.Series) -> float:
+        per_share = float(row.get("dividend_per_share", 0.0) or 0.0)
+        if not math.isfinite(per_share) or per_share <= 0:
+            return 0.0
+        cash = (
+            position.quantity
+            * per_share
+            * (1 - self.config.dividend_withholding_rate)
+        )
+        position.cumulative_dividend_cash += cash
+        position.corporate_action_flag = True
+        return cash
+
+    @staticmethod
+    def _apply_dividend_reference_adjustment(position: Position, row: pd.Series) -> None:
+        per_share = float(row.get("dividend_per_share", 0.0) or 0.0)
+        if not math.isfinite(per_share) or per_share <= 0:
+            return
+        position.initial_stop = max(0.0, position.initial_stop - per_share)
+        position.current_stop = max(0.0, position.current_stop - per_share)
+        position.highest_close = max(0.0, position.highest_close - per_share)
+        position.corporate_action_flag = True
+
+    @staticmethod
+    def _raw_basis_atr(row: pd.Series, signal_atr: float, price_point: str) -> float:
+        raw_price = float(row[f"tuprs_{price_point}"])
+        signal_price = float(row[f"tuprs_signal_{price_point}"])
+        if not math.isfinite(signal_price) or signal_price <= 0:
+            raise ValueError("TUPRS signal price must be positive for ATR conversion")
+        return signal_atr * raw_price / signal_price
+
+    @staticmethod
+    def _apply_stock_split(position: Position, row: pd.Series) -> None:
+        factor = float(row.get("stock_split_factor", 0.0) or 0.0)
+        if not math.isfinite(factor) or factor <= 0:
+            return
+        position.corporate_action_flag = True
+        if str(row.get("price_basis", position.price_basis)) != PRICE_BASIS_UNADJUSTED:
+            return
+        position.quantity = int(round(position.quantity * factor))
+        position.entry_price_raw /= factor
+        position.entry_price_effective /= factor
+        position.initial_stop /= factor
+        position.current_stop /= factor
+        position.highest_close /= factor
+        position.maximum_price /= factor
+        position.minimum_price /= factor
+        position.cumulative_stock_split_factor *= factor
+        position.price_basis = PRICE_BASIS_UNADJUSTED
+
+    @staticmethod
     def _equity_row(
         row: pd.Series,
         cash: float,
         position: Position | None,
+        dividend_cash: float,
+        cumulative_dividend_cash: float,
     ) -> dict[str, object]:
         quantity = position.quantity if position is not None else 0
         market_value = quantity * float(row["tuprs_close"])
@@ -304,6 +472,12 @@ class BacktestEngine:
             "total_equity": cash + market_value,
             "position_open": position is not None,
             "current_stop": position.current_stop if position is not None else 0.0,
+            "dividend_per_share": float(row.get("dividend_per_share", 0.0) or 0.0),
+            "dividend_cash": dividend_cash,
+            "cumulative_dividend_cash": cumulative_dividend_cash,
+            "stock_split_factor": float(row.get("stock_split_factor", 0.0) or 0.0),
+            "corporate_action_flag": bool(row.get("corporate_action_flag", False)),
+            "price_basis": str(row.get("price_basis", "raw_ohlc_split_basis_unknown")),
         }
 
     def _finalize_equity(self, equity: pd.DataFrame) -> pd.DataFrame:

@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pandas as pd
+import pytest
 
 from bist_research.features import (
     EXTERNAL_MARKETS,
@@ -51,6 +52,7 @@ def _feature_input(row_count: int = 260) -> pd.DataFrame:
     frame = pd.DataFrame(
         {
             "date": dates,
+            "tuprs_open": 100.0 + index,
             "tuprs_close": 100.0 + index,
             "tuprs_high": 101.0 + index,
             "tuprs_low": 99.0 + index,
@@ -92,7 +94,7 @@ def test_features_have_expected_windows_and_warmup_marker() -> None:
     assert features["is_indicator_warmup"].sum() == 200
     assert features.loc[199, "is_indicator_warmup"]
     assert not features.loc[200, "is_indicator_warmup"]
-    assert features.loc[20, "relative_momentum_20d"] == 0.0
+    assert features.loc[20, "relative_momentum_20d"] == pytest.approx(0.0, abs=1e-15)
     assert features.loc[19, "volume_average_20d"] == 1_009.5
     assert features.loc[200, "ema_200"] > 0
     assert features.loc[20, "rsi_14"] == 100.0
@@ -109,6 +111,122 @@ def test_changing_future_values_does_not_change_past_features() -> None:
     changed = add_features(changed_input)
 
     pd.testing.assert_frame_equal(original.iloc[:-1], changed.iloc[:-1])
+
+
+def test_signal_return_is_zero_for_a_pure_ex_dividend_price_drop() -> None:
+    source = _feature_input(40)
+    source["dividend_per_share"] = 0.0
+    ex_date = 20
+    previous = source.loc[ex_date - 1, [
+        "tuprs_open",
+        "tuprs_high",
+        "tuprs_low",
+        "tuprs_close",
+    ]]
+    source.loc[
+        ex_date,
+        ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"],
+    ] = previous.to_numpy(dtype="float64") - 10.0
+    source.loc[ex_date, "dividend_per_share"] = 10.0
+
+    features = add_features(source)
+
+    assert features.loc[ex_date, "tuprs_close"] == pytest.approx(
+        features.loc[ex_date - 1, "tuprs_close"] - 10.0
+    )
+    assert features.loc[ex_date, "tuprs_signal_close"] == pytest.approx(
+        features.loc[ex_date - 1, "tuprs_signal_close"]
+    )
+    assert features.loc[ex_date, "tuprs_return_1d"] == pytest.approx(0.0)
+
+
+def test_future_dividend_does_not_change_earlier_signal_features() -> None:
+    source = _feature_input()
+    source["dividend_per_share"] = 0.0
+    expected = add_features(source)
+    changed = source.copy()
+    cutoff = 130
+    changed.loc[cutoff + 1, "dividend_per_share"] = 25.0
+
+    actual = add_features(changed)
+    columns = [
+        "tuprs_signal_open",
+        "tuprs_signal_high",
+        "tuprs_signal_low",
+        "tuprs_signal_close",
+        "tuprs_return_1d",
+        "ema_20",
+        "rsi_14",
+        "atr_14",
+        "relative_strength_xu100",
+        "relative_momentum_20d",
+    ]
+    pd.testing.assert_frame_equal(
+        expected.loc[:cutoff, columns],
+        actual.loc[:cutoff, columns],
+    )
+
+
+def test_multiple_future_market_and_action_mutations_leave_prior_features_unchanged() -> None:
+    source = _feature_input()
+    source["dividend_per_share"] = 0.0
+    source["stock_split_factor"] = 0.0
+    source["corporate_action_flag"] = False
+    source["price_basis"] = "raw_ohlc_split_adjusted"
+    expected = add_features(source)
+
+    for cutoff in (60, 130, 210):
+        changed = source.copy()
+        future = changed.index[cutoff + 1 :]
+        changed.loc[
+            future,
+            ["tuprs_open", "tuprs_high", "tuprs_low", "tuprs_close"],
+        ] *= 1.7
+        changed.loc[future, "tuprs_volume"] *= 3.0
+        changed.loc[
+            future,
+            ["xu100_close", "xusin_close", "brent_close", "usdtry_close"],
+        ] *= 2.2
+        changed.loc[future, "dividend_per_share"] = 9.0
+        changed.loc[future, "stock_split_factor"] = 3.0
+        changed.loc[future, "corporate_action_flag"] = True
+
+        actual = add_features(changed)
+
+        pd.testing.assert_frame_equal(
+            expected.iloc[: cutoff + 1].reset_index(drop=True),
+            actual.iloc[: cutoff + 1].reset_index(drop=True),
+        )
+
+
+def test_zero_volume_rows_do_not_affect_technical_features() -> None:
+    source = _feature_input()
+    zero_volume = source.iloc[[120]].copy()
+    zero_volume["date"] = zero_volume["date"] + pd.Timedelta(hours=12)
+    zero_volume["tuprs_open"] = 900.0
+    zero_volume["tuprs_high"] = 910.0
+    zero_volume["tuprs_low"] = 890.0
+    zero_volume["tuprs_close"] = 905.0
+    zero_volume["tuprs_volume"] = 0.0
+    with_zero = pd.concat([source, zero_volume], ignore_index=True).sort_values("date")
+
+    expected = add_features(source)
+    actual = add_features(with_zero)
+
+    columns = [
+        "date",
+        "ema_20",
+        "ema_50",
+        "ema_100",
+        "ema_200",
+        "rsi_14",
+        "atr_14",
+        "relative_momentum_20d",
+        "relative_momentum_60d",
+        "relative_momentum_120d",
+    ]
+    pd.testing.assert_frame_equal(actual[columns], expected[columns])
+    assert actual["tuprs_volume"].gt(0).all()
 
 
 def test_pipeline_saves_features_and_quality_summary(tmp_path: Path) -> None:
