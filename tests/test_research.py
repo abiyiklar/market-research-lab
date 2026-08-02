@@ -127,19 +127,35 @@ def test_scoring_applies_all_hard_gates() -> None:
 
 def test_append_csv_preserves_existing_experiment(tmp_path) -> None:
     path = tmp_path / "results.csv"
-    append_csv(path, pd.DataFrame([{"experiment_id": "one", "score": 1.0}]), ["experiment_id"])
+    append_csv(
+        path,
+        pd.DataFrame(
+            [
+                {
+                    "experiment_id": "one",
+                    "score": 1.0,
+                    "failed_gates": None,
+                    "stress_test_result": None,
+                    "stability_class": None,
+                }
+            ]
+        ),
+        ["experiment_id"],
+    )
     combined = append_csv(
         path,
         pd.DataFrame(
             [
-                {"experiment_id": "one", "score": 99.0},
-                {"experiment_id": "two", "score": 2.0},
+                {"experiment_id": "one", "score": 99.0, "failed_gates": "drawdown"},
+                {"experiment_id": "two", "score": 2.0, "failed_gates": "none"},
             ]
         ),
         ["experiment_id"],
     )
 
     assert combined.set_index("experiment_id").loc["one", "score"] == 1.0
+    assert combined.set_index("experiment_id").loc["one", "failed_gates"] == "none"
+    assert not combined.isna().any().any()
     assert len(combined) == 2
 
 

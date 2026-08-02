@@ -40,6 +40,14 @@ def append_csv(
         combined = pd.concat([existing, new_rows], ignore_index=True)
     else:
         combined = new_rows.copy()
+    sentinel_values = {
+        "failed_gates": "none",
+        "stress_test_result": "not_run",
+        "stability_class": "not_run",
+    }
+    for column, sentinel in sentinel_values.items():
+        if column in combined:
+            combined[column] = combined[column].fillna(sentinel).replace("", sentinel)
     combined = combined.drop_duplicates(key_columns, keep="first").reset_index(drop=True)
     combined.to_csv(path, index=False)
     return combined

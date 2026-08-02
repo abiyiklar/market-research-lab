@@ -71,6 +71,7 @@ def score_experiments(walk_forward_results: pd.DataFrame) -> pd.DataFrame:
         }
         hard_gate_pass = all(gate_results.values())
         failed_gates = ";".join(name for name, passed in gate_results.items() if not passed)
+        failed_gates = failed_gates or "none"
         score = composite_score(
             median_cagr,
             median_profit_factor,
