@@ -11,6 +11,7 @@ File or Folder | Purpose
 `data/raw/` | yfinance raw downloads, ignored by git
 `data/processed/` | cleaned datasets and reports, ignored by git
 `data/features/` | generated analysis datasets and quality summaries, ignored by git
+`data/quality/` | generated per-symbol and panel data-quality reports, ignored by git
 `data/backtest/` | generated backtest tables, ignored by git
 `reports/` | generated backtest reports and charts, ignored by git
 `logs/` | collector logs, ignored by git
@@ -55,6 +56,45 @@ python -m bist_research --start-date 2020-01-01 --symbols TUPRS.IS XU100.IS
 ```
 
 The collector removes rows with missing `Close` values. Zero-volume records are reported separately only for equity symbols.
+
+## Multi-Stock BIST Panel
+
+Collect the enabled `initial_bist_panel` universe with one command:
+
+```powershell
+python -m bist_research.collector --universe initial_bist_panel
+```
+
+The initial panel contains `TUPRS.IS`, `THYAO.IS`, `ASELS.IS`, `FROTO.IS`, `EREGL.IS`, `SISE.IS`, `AKBNK.IS`, `ISCTR.IS`, `KCHOL.IS`, `BIMAS.IS`, `TCELL.IS`, and `ENKAI.IS`. `XU100.IS` is the common market benchmark. The configured sector benchmarks are `XUSIN.IS`, `XUHIZ.IS`, `XBANK.IS`, `XUMAL.IS`, and `XUTEK.IS`.
+
+Run a single-symbol smoke collection:
+
+```powershell
+python -m bist_research.collector --symbols ASELS.IS
+```
+
+Raw downloads are immutable timestamped snapshots under `data/raw/equities/<symbol>/`. Incremental runs start after the latest processed date where practical, merge new and prior observations, and remove duplicate dates. Canonical cleaned files are written to `data/processed/equities/<symbol>/prices.*`. Benchmark data uses the same layout under `data/raw/benchmarks/` and `data/processed/benchmarks/`.
+
+Collection preserves raw and adjusted OHLC data, volume, dividends, stock splits, repaired-row flags, source symbols, and collection timestamps. A failed symbol is isolated and marked excluded. If a preferred sector benchmark cannot be downloaded, the assignment explicitly records the fallback to `XU100.IS`; the substitution is never silent.
+
+Quality outputs include:
+
+- `data/quality/<symbol>_collection_quality.csv`
+- `data/quality/benchmark_assignments.csv`
+- `data/quality/multi_stock_collection_summary.csv`
+
+Build generic features for the panel or one symbol:
+
+```powershell
+python -m bist_research.features --universe initial_bist_panel
+python -m bist_research.features --symbols ASELS.IS
+```
+
+Each symbol is written independently to `data/features/equities/<symbol>/features.csv` and `features.parquet`. The panel summary is `data/quality/multi_stock_feature_summary.csv`.
+
+The feature calendar contains only the stock's valid tradable sessions. Stock OHLC and volume are never filled. Market and sector index values may be forward-filled from past observations only. Indicators use causal total-return-continuous signal OHLC, while `execution_open`, `execution_high`, `execution_low`, and `execution_close` preserve raw prices.
+
+Sprint 1 provides data collection, quality reporting, and deterministic feature generation only. It does not perform portfolio optimization, machine learning, strategy parameter search, backtesting, or a research run.
 
 ## Build TUPRS Features
 

@@ -5,7 +5,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
+import numpy as np
 import pandas as pd
+
+from .collector import panel_configs, safe_symbol_name
+from .config import INITIAL_BIST_PANEL, SymbolConfig
+from .data_quality import OHLC_COLUMNS, tradable_session_mask
 
 
 MARKET_FILES: Mapping[str, str] = {
@@ -52,6 +57,43 @@ class FeatureOutputPaths:
     csv: Path
     parquet: Path
     summary: Path
+
+
+@dataclass(frozen=True)
+class PanelFeatureResult:
+    symbol: str
+    success: bool
+    rows: int = 0
+    post_warmup_missing_values: int = 0
+    post_warmup_infinite_values: int = 0
+    duplicate_dates: int = 0
+    sector_benchmark_used: str | None = None
+    sector_benchmark_fallback: bool = False
+    excluded: bool = False
+    error: str | None = None
+
+
+GENERIC_FEATURE_COLUMNS = (
+    "daily_return",
+    "ema_20",
+    "ema_50",
+    "ema_100",
+    "ema_200",
+    "rsi_14",
+    "atr_14",
+    "volatility_20",
+    "volatility_60",
+    "volume_average_20",
+    "volume_ratio_20",
+    "relative_strength_market",
+    "relative_momentum_market_20",
+    "relative_momentum_market_60",
+    "relative_momentum_market_120",
+    "relative_strength_sector",
+    "relative_momentum_sector_20",
+    "relative_momentum_sector_60",
+    "relative_momentum_sector_120",
+)
 
 
 def _load_market_frame(processed_dir: Path, market: str) -> pd.DataFrame:
@@ -267,8 +309,257 @@ def run_feature_pipeline(
     return save_feature_dataset(features, summary, output_dir)
 
 
+def build_signal_prices(stock: pd.DataFrame) -> pd.DataFrame:
+    """Build a causal total-return series while preserving raw intraday geometry."""
+
+    ordered = stock.sort_values("Date").reset_index(drop=True).copy()
+    raw = ordered[list(OHLC_COLUMNS)].apply(pd.to_numeric, errors="coerce")
+    dividends = pd.to_numeric(ordered.get("Dividends", 0.0), errors="coerce").fillna(0.0)
+    splits = pd.to_numeric(ordered.get("Stock Splits", 0.0), errors="coerce").fillna(0.0)
+
+    signal_close = pd.Series(np.nan, index=ordered.index, dtype="float64")
+    if ordered.empty:
+        return pd.DataFrame(index=ordered.index, columns=[f"signal_{name.lower()}" for name in OHLC_COLUMNS])
+    signal_close.iloc[0] = raw["Close"].iloc[0]
+
+    for index in range(1, len(ordered)):
+        previous_raw_close = raw["Close"].iloc[index - 1]
+        current_raw_close = raw["Close"].iloc[index]
+        split_factor = 1.0
+        split = float(splits.iloc[index])
+        if split > 0 and np.isfinite(previous_raw_close) and previous_raw_close > 0:
+            observed_open_ratio = raw["Open"].iloc[index] / previous_raw_close
+            if abs(observed_open_ratio - (1.0 / split)) < abs(observed_open_ratio - 1.0):
+                split_factor = split
+
+        if not np.isfinite([previous_raw_close, current_raw_close]).all() or previous_raw_close <= 0:
+            continue
+        total_return_ratio = ((current_raw_close + dividends.iloc[index]) * split_factor) / previous_raw_close
+        signal_close.iloc[index] = signal_close.iloc[index - 1] * total_return_ratio
+
+    scale = signal_close / raw["Close"].replace(0, np.nan)
+    return pd.DataFrame(
+        {
+            "signal_open": raw["Open"] * scale,
+            "signal_high": raw["High"] * scale,
+            "signal_low": raw["Low"] * scale,
+            "signal_close": signal_close,
+        }
+    )
+
+
+def _prepare_benchmark(frame: pd.DataFrame, output_column: str) -> pd.DataFrame:
+    required = {"Date", "Close"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"Benchmark data is missing columns: {', '.join(sorted(missing))}")
+    prepared = frame[["Date", "Close"]].copy()
+    prepared["date"] = pd.to_datetime(prepared.pop("Date"), errors="coerce").dt.tz_localize(None).dt.normalize()
+    prepared[output_column] = pd.to_numeric(prepared.pop("Close"), errors="coerce")
+    return prepared.dropna(subset=["date"]).sort_values("date").drop_duplicates("date", keep="last")
+
+
+def _generic_atr(frame: pd.DataFrame, periods: int = 14) -> pd.Series:
+    previous_close = frame["signal_close"].shift(1)
+    true_range = pd.concat(
+        [
+            frame["signal_high"] - frame["signal_low"],
+            (frame["signal_high"] - previous_close).abs(),
+            (frame["signal_low"] - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return true_range.ewm(alpha=1 / periods, adjust=False, min_periods=periods).mean()
+
+
+def build_symbol_features(
+    config: SymbolConfig,
+    stock: pd.DataFrame,
+    market_benchmark: pd.DataFrame,
+    sector_benchmark: pd.DataFrame,
+    sector_benchmark_used: str,
+    sector_benchmark_fallback: bool = False,
+) -> pd.DataFrame:
+    if "Symbol" in stock.columns:
+        observed_symbols = set(stock["Symbol"].dropna().astype(str).unique())
+        if observed_symbols.difference({config.symbol}):
+            raise ValueError(f"Cross-symbol rows found for {config.symbol}: {sorted(observed_symbols)}")
+
+    prepared = stock.copy()
+    prepared["Date"] = pd.to_datetime(prepared["Date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    prepared = prepared.dropna(subset=["Date"]).sort_values("Date").drop_duplicates("Date", keep="last")
+    prepared = prepared.loc[tradable_session_mask(prepared)].reset_index(drop=True)
+    if prepared.empty:
+        raise ValueError(f"{config.symbol} has no valid tradable sessions")
+
+    features = pd.DataFrame(
+        {
+            "symbol": config.symbol,
+            "date": prepared["Date"],
+            "execution_open": pd.to_numeric(prepared["Open"], errors="coerce"),
+            "execution_high": pd.to_numeric(prepared["High"], errors="coerce"),
+            "execution_low": pd.to_numeric(prepared["Low"], errors="coerce"),
+            "execution_close": pd.to_numeric(prepared["Close"], errors="coerce"),
+            "adjusted_close": pd.to_numeric(prepared.get("Adj Close"), errors="coerce"),
+            "volume": pd.to_numeric(prepared["Volume"], errors="coerce"),
+            "dividend": pd.to_numeric(prepared.get("Dividends", 0.0), errors="coerce").fillna(0.0),
+            "stock_split": pd.to_numeric(prepared.get("Stock Splits", 0.0), errors="coerce").fillna(0.0),
+            "repaired_data": prepared.get("Repaired", pd.Series(False, index=prepared.index)).fillna(False).astype(bool),
+            "source_symbol": prepared.get("Source Symbol", prepared.get("Symbol", config.symbol)),
+            "collection_timestamp": prepared.get("Collection Timestamp", pd.NA),
+        }
+    )
+    signal = build_signal_prices(prepared)
+    features = pd.concat([features, signal], axis=1)
+
+    features = features.merge(
+        _prepare_benchmark(market_benchmark, "market_close"),
+        on="date",
+        how="left",
+        validate="one_to_one",
+    )
+    features = features.merge(
+        _prepare_benchmark(sector_benchmark, "sector_close"),
+        on="date",
+        how="left",
+        validate="one_to_one",
+    )
+    features[["market_close", "sector_close"]] = features[["market_close", "sector_close"]].ffill()
+    features["market_benchmark"] = config.market_benchmark
+    features["sector_benchmark"] = sector_benchmark_used
+
+    features["daily_return"] = _daily_return(features["signal_close"])
+    for periods in (20, 50, 100, 200):
+        features[f"ema_{periods}"] = features["signal_close"].ewm(
+            span=periods,
+            adjust=False,
+            min_periods=periods,
+        ).mean()
+    features["rsi_14"] = _rsi(features["signal_close"])
+    features["atr_14"] = _generic_atr(features)
+    for periods in (20, 60):
+        features[f"volatility_{periods}"] = (
+            features["daily_return"].rolling(periods, min_periods=periods).std()
+            * (TRADING_DAYS_PER_YEAR**0.5)
+        )
+    features["volume_average_20"] = features["volume"].rolling(20, min_periods=20).mean()
+    features["volume_ratio_20"] = features["volume"] / features["volume_average_20"].replace(0, np.nan)
+
+    features["relative_strength_market"] = features["signal_close"] / features["market_close"]
+    features["relative_strength_sector"] = features["signal_close"] / features["sector_close"]
+    for periods in (20, 60, 120):
+        features[f"relative_momentum_market_{periods}"] = _relative_momentum(
+            features["relative_strength_market"],
+            periods,
+        )
+        features[f"relative_momentum_sector_{periods}"] = _relative_momentum(
+            features["relative_strength_sector"],
+            periods,
+        )
+
+    features["is_indicator_warmup"] = pd.Series(range(len(features)), index=features.index).lt(WARMUP_DAYS)
+    features["quality_valid_ohlc"] = True
+    features["quality_positive_volume"] = True
+    features["quality_repaired"] = features["repaired_data"]
+    features["quality_market_missing"] = features["market_close"].isna()
+    features["quality_sector_missing"] = features["sector_close"].isna()
+    features["quality_sector_fallback"] = sector_benchmark_fallback
+    return features
+
+
+def _load_panel_prices(processed_dir: Path, category: str, symbol: str) -> pd.DataFrame:
+    path = processed_dir / category / safe_symbol_name(symbol) / "prices.parquet"
+    if not path.exists():
+        raise FileNotFoundError(f"Processed price file not found: {path}")
+    return pd.read_parquet(path)
+
+
+def _benchmark_assignment(quality_dir: Path, config: SymbolConfig) -> tuple[str, bool]:
+    path = quality_dir / "benchmark_assignments.csv"
+    if path.exists():
+        assignments = pd.read_csv(path)
+        matching = assignments.loc[assignments["symbol"].eq(config.symbol)]
+        if not matching.empty:
+            row = matching.iloc[-1]
+            used = row.get("sector_benchmark_used")
+            if pd.notna(used):
+                return str(used), bool(row.get("sector_benchmark_fallback", False))
+    return config.preferred_sector_benchmark or config.market_benchmark, False
+
+
+def _collection_exclusion(quality_dir: Path, symbol: str) -> tuple[bool, str]:
+    path = quality_dir / f"{safe_symbol_name(symbol)}_collection_quality.csv"
+    if not path.exists():
+        return False, ""
+    quality = pd.read_csv(path)
+    if quality.empty:
+        return False, ""
+    excluded = str(quality.iloc[-1].get("excluded", False)).lower() == "true"
+    return excluded, str(quality.iloc[-1].get("exclusion_reason", ""))
+
+
+def build_panel_features(
+    symbols: Sequence[SymbolConfig],
+    processed_dir: Path = Path("data/processed"),
+    output_dir: Path = Path("data/features"),
+    quality_dir: Path = Path("data/quality"),
+) -> list[PanelFeatureResult]:
+    quality_dir.mkdir(parents=True, exist_ok=True)
+    results: list[PanelFeatureResult] = []
+    for config in symbols:
+        excluded, exclusion_reason = _collection_exclusion(quality_dir, config.symbol)
+        if excluded:
+            results.append(
+                PanelFeatureResult(
+                    symbol=config.symbol,
+                    success=False,
+                    excluded=True,
+                    error=exclusion_reason,
+                )
+            )
+            continue
+        try:
+            stock = _load_panel_prices(processed_dir, "equities", config.symbol)
+            market = _load_panel_prices(processed_dir, "benchmarks", config.market_benchmark)
+            sector_used, fallback = _benchmark_assignment(quality_dir, config)
+            sector = _load_panel_prices(processed_dir, "benchmarks", sector_used)
+            features = build_symbol_features(config, stock, market, sector, sector_used, fallback)
+            symbol_output = output_dir / "equities" / safe_symbol_name(config.symbol)
+            save_frame = FeatureOutputPaths(
+                csv=symbol_output / "features.csv",
+                parquet=symbol_output / "features.parquet",
+                summary=symbol_output / "feature_quality.csv",
+            )
+            symbol_output.mkdir(parents=True, exist_ok=True)
+            features.to_csv(save_frame.csv, index=False)
+            features.to_parquet(save_frame.parquet, index=False)
+
+            post_warmup = features.loc[~features["is_indicator_warmup"], GENERIC_FEATURE_COLUMNS]
+            numeric = post_warmup.apply(pd.to_numeric, errors="coerce")
+            missing = int(numeric.isna().sum().sum())
+            infinite = int(np.isinf(numeric.to_numpy()).sum())
+            result = PanelFeatureResult(
+                symbol=config.symbol,
+                success=True,
+                rows=len(features),
+                post_warmup_missing_values=missing,
+                post_warmup_infinite_values=infinite,
+                duplicate_dates=int(features["date"].duplicated().sum()),
+                sector_benchmark_used=sector_used,
+                sector_benchmark_fallback=fallback,
+            )
+            pd.DataFrame([result.__dict__]).to_csv(save_frame.summary, index=False)
+        except Exception as exc:
+            result = PanelFeatureResult(config.symbol, False, error=str(exc))
+        results.append(result)
+
+    summary = pd.DataFrame(result.__dict__ for result in results)
+    summary.to_csv(quality_dir / "multi_stock_feature_summary.csv", index=False)
+    return results
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Build the TUPRS market research feature dataset.")
+    parser = argparse.ArgumentParser(description="Build BIST market research feature datasets.")
     parser.add_argument(
         "--processed-dir",
         type=Path,
@@ -281,11 +572,31 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=Path("data/features"),
         help="Feature dataset output directory.",
     )
+    parser.add_argument(
+        "--quality-dir",
+        type=Path,
+        default=Path("data/quality"),
+        help="Collection and feature quality report directory.",
+    )
+    parser.add_argument("--universe", choices=[INITIAL_BIST_PANEL], help="Configured research universe.")
+    parser.add_argument("--symbols", nargs="+", help="Optional panel symbol override.")
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.universe or args.symbols:
+        results = build_panel_features(
+            panel_configs(args.universe, args.symbols),
+            processed_dir=args.processed_dir,
+            output_dir=args.output_dir,
+            quality_dir=args.quality_dir,
+        )
+        for result in results:
+            status = "ok" if result.success else "excluded" if result.excluded else "failed"
+            print(f"{result.symbol}: {status} ({result.rows} rows)")
+        return 0 if all(result.success or result.excluded for result in results) else 1
+
     paths = run_feature_pipeline(args.processed_dir, args.output_dir)
     print(f"Feature CSV: {paths.csv}")
     print(f"Feature Parquet: {paths.parquet}")

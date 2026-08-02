@@ -71,6 +71,7 @@ def test_download_symbol_retries_and_normalizes_response() -> None:
                 "Close": [1.1],
                 "Adj Close": [1.1],
                 "Volume": [100],
+                "Repaired?": [True],
             },
             index=pd.DatetimeIndex(["2024-01-01"], name="Date"),
         )
@@ -86,6 +87,8 @@ def test_download_symbol_retries_and_normalizes_response() -> None:
     assert calls == ["TUPRS.IS", "TUPRS.IS"]
     assert frame.iloc[0]["Symbol"] == "TUPRS.IS"
     assert frame.iloc[0]["Close"] == 1.1
+    assert bool(frame.iloc[0]["Repaired"])
+    assert "Repaired?" not in frame.columns
 
 
 def test_save_frame_writes_csv_and_parquet(tmp_path: Path, monkeypatch) -> None:
