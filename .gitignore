@@ -64,6 +64,7 @@ data/features/
 data/quality/
 data/backtest/
 data/research/
+data/signals/
 reports/
 local_settings.py
 db.sqlite3

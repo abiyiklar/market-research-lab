@@ -14,7 +14,8 @@ File or Folder | Purpose
 `data/quality/` | generated per-symbol and panel data-quality reports, ignored by git
 `data/backtest/` | generated backtest tables, ignored by git
 `data/research/` | generated experiment, walk-forward, stress, and ablation tables, ignored by git
-`reports/` | generated backtest reports and charts, ignored by git
+`data/signals/` | generated cross-sectional scores and signal diagnostics, ignored by git
+`reports/` | generated research reports and charts, ignored by git
 `logs/` | collector logs, ignored by git
 
 ## Setup
@@ -104,6 +105,24 @@ Each symbol is written independently to `data/features/equities/<symbol>/feature
 The feature calendar contains only the stock's valid tradable sessions. Stock OHLC and volume are never filled. Market and sector index values may be forward-filled from past observations only. Indicators use causal total-return-continuous signal OHLC, while `execution_open`, `execution_high`, `execution_low`, and `execution_close` preserve raw prices.
 
 Sprint 1 provides data collection, quality reporting, and deterministic feature generation only. It does not perform portfolio optimization, machine learning, strategy parameter search, backtesting, or a research run.
+
+## Build Scores and Signals
+
+Build transparent same-date cross-sectional scores and causal signal diagnostics for the initial panel:
+
+```powershell
+python -m bist_research.signals --universe initial_bist_panel
+```
+
+An explicit subset is also supported. The fixed minimum of eight valid same-date symbols still applies, so a smaller subset produces unscored rows marked with `insufficient_cross_section=true`:
+
+```powershell
+python -m bist_research.signals --symbols TUPRS.IS ASELS.IS AKBNK.IS
+```
+
+The command writes daily scores, current rankings and signals, BUY and SELL events, forward-return diagnostics, and the signal-quality summary under `data/signals/`. It generates the research report at `reports/score_signal_research.md`. BUY events are formed at the signal close and evaluated from the next valid signal open. Stock rows are never forward-filled, sector fallback rows receive a neutral component score of 50, and dates with fewer than eight valid post-warm-up stocks are not scored.
+
+The score thresholds and signal rules are fixed research assumptions. Outputs are diagnostic only: this sprint does not construct a portfolio, optimize parameters, train a model, simulate live trading, or provide investment advice.
 
 ## Build TUPRS Features
 
