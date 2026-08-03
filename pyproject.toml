@@ -22,6 +22,7 @@ bist-features = "bist_research.features:main"
 bist-backtest = "bist_research.backtest.cli:main"
 bist-research = "bist_research.research.cli:main"
 bist-signals = "bist_research.signals.cli:main"
+bist-portfolio = "bist_research.portfolio.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
