@@ -15,6 +15,7 @@ File or Folder | Purpose
 `data/backtest/` | generated backtest tables, ignored by git
 `data/research/` | generated experiment, walk-forward, stress, and ablation tables, ignored by git
 `data/signals/` | generated cross-sectional scores and signal diagnostics, ignored by git
+`data/portfolio/` | generated portfolio accounting, audit, benchmark, and stress tables, ignored by git
 `reports/` | generated research reports and charts, ignored by git
 `logs/` | collector logs, ignored by git
 
@@ -123,6 +124,30 @@ python -m bist_research.signals --symbols TUPRS.IS ASELS.IS AKBNK.IS
 The command writes daily scores, current rankings and signals, BUY and SELL events, forward-return diagnostics, and the signal-quality summary under `data/signals/`. It generates the research report at `reports/score_signal_research.md`. BUY events are formed at the signal close and evaluated from the next valid signal open. Stock rows are never forward-filled, sector fallback rows receive a neutral component score of 50, and dates with fewer than eight valid post-warm-up stocks are not scored.
 
 The score thresholds and signal rules are fixed research assumptions. Outputs are diagnostic only: this sprint does not construct a portfolio, optimize parameters, train a model, simulate live trading, or provide investment advice.
+
+## Run Portfolio Backtest
+
+Run the frozen, causal, long-only portfolio policy over the existing 12-stock score and signal panel:
+
+```powershell
+python -m bist_research.portfolio --universe initial_bist_panel
+```
+
+The same command is available after package installation as `bist-portfolio`. Starting capital, maximum positions, and the all-in per-side cost assumption are configurable:
+
+```powershell
+python -m bist_research.portfolio `
+  --universe initial_bist_panel `
+  --starting-capital 1000000 `
+  --max-positions 4 `
+  --cost-rate 0.0015
+```
+
+Signals formed at date T close can execute only at the next valid raw stock-session open. SELL orders execute before BUY orders, positions use integer shares without leverage, and stock prices are never forward-filled for execution. Cash accounting uses raw opens and closes, explicit dividends, transaction costs, and event-date causal split-basis inference. Missing held-stock sessions use only the latest prior observed raw close and are marked as stale valuations.
+
+The command writes daily accounting, order/trade/position audits, period returns, benchmark comparisons, contribution tables, fixed stress cases, and research gates under `data/portfolio/`. It generates `reports/portfolio_backtest_research.md`. Both locations are ignored by git.
+
+The XU100 comparison uses the available price-index series and therefore excludes index dividends. The equal-weight 12-stock benchmark uses raw closes and explicit reported corporate actions. Transaction costs are research assumptions rather than exact broker tariffs. Results are inspected historical evidence, not unseen out-of-sample evidence, investment advice, or a deployment-ready system.
 
 ## Build TUPRS Features
 
